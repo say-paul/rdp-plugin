@@ -37,14 +37,18 @@ python -m pip install --user mujoco
 
 ## Joint controls and animation
 
-After importing a compiled model, select its robot root or any child body. The **Joint Controls** section exposes each hinge joint in radians and each slide joint in meters, using the limits compiled by MuJoCo.
+After importing a compiled model, press **Open Joint Controller** in the library or open the dedicated **Robot Joints** sidebar tab. The controller targets the most recently imported robot automatically; selecting any root or child switches it to that robot. It exposes each hinge joint in radians and each slide joint in meters, using the limits compiled by MuJoCo.
 
 - Change a `qpos` slider to pose the robot and its complete downstream body hierarchy.
 - Press **Keyframe** to insert the current joint pose at the active timeline frame.
 - Move to another frame, change the sliders, and keyframe again to create an animation.
 - Press **Reset** to restore and keyframe the MuJoCo home pose at the current frame.
 
-These controls provide accurate kinematic posing and animation. Version 0.5 does not yet step MuJoCo dynamics from the Blender timeline; Blender rigid-body physics is not a substitute for MuJoCo's articulated dynamics.
+These controls provide accurate kinematic posing and animation. Version 0.6 does not yet step MuJoCo dynamics from the Blender timeline; Blender rigid-body physics is not a substitute for MuJoCo's articulated dynamics.
+
+## Collision geometry
+
+Enable **Load Collision Geoms** before adding a robot to import MuJoCo collision groups alongside the visual model. Collision objects are tagged with `is_collision`, shown as red wireframes, and excluded from rendering. The option affects newly imported robots; reimport an existing robot after changing it.
 
 ## Local validation
 

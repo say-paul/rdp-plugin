@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 import bpy
-from bpy.props import BoolProperty, CollectionProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup, UIList
 from mathutils import Euler, Matrix, Quaternion, Vector
 
@@ -18,7 +18,7 @@ from .setup_parser import discover_robot_definitions
 bl_info = {
     "name": "MuJoCo Robot Arm Library",
     "author": "Caryam",
-    "version": (0, 5, 0),
+    "version": (0, 7, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Robot Library",
     "description": "Discover robot arms from a MuJoCo setup and drag them into the scene",
@@ -347,7 +347,12 @@ def _place_robot(item: RobotLibraryItem, location: Vector) -> bpy.types.Object:
                 try:
                     from .compiled_importer import import_compiled_mjcf
 
-                    imported = import_compiled_mjcf(asset_path, root, robot_collection)
+                    imported = import_compiled_mjcf(
+                        asset_path,
+                        root,
+                        robot_collection,
+                        include_collisions=bpy.context.scene.robot_library_include_collisions,
+                    )
                     hierarchy_created = bool(imported)
                 except (ImportError, ModuleNotFoundError, RuntimeError, ValueError):
                     imported = _import_mjcf_meshes(asset_path)
@@ -366,6 +371,7 @@ def _place_robot(item: RobotLibraryItem, location: Vector) -> bpy.types.Object:
     bpy.ops.object.select_all(action="DESELECT")
     root.select_set(True)
     bpy.context.view_layer.objects.active = root
+    bpy.context.scene.robot_library_control_root = root
     return root
 
 
@@ -388,6 +394,27 @@ def _joint_controls(root: bpy.types.Object) -> list[bpy.types.Object]:
         if ancestor == root:
             controls.append(obj)
     return sorted(controls, key=lambda obj: int(obj.get("mujoco_joint_id", 0)))
+
+
+def _control_root(context: bpy.types.Context) -> bpy.types.Object | None:
+    selected_root = _selected_robot_root(context.active_object)
+    if selected_root is not None and selected_root.get("import_mode") == "mujoco_compiled":
+        return selected_root
+    stored_root = context.scene.robot_library_control_root
+    if stored_root is not None and stored_root.get("import_mode") == "mujoco_compiled":
+        return stored_root
+    return None
+
+
+def _draw_joint_controls(layout: bpy.types.UILayout, root: bpy.types.Object, controls: list[bpy.types.Object]) -> None:
+    layout.label(text=root.name, icon="CONSTRAINT_BONE")
+    for joint in controls:
+        layout.prop(joint, '["qpos"]', text=joint.name.removeprefix("Joint: "), slider=True)
+    action_row = layout.row(align=True)
+    reset_operator = action_row.operator("robot_library.reset_pose", text="Reset", icon="LOOP_BACK")
+    reset_operator.root_name = root.name
+    keyframe_operator = action_row.operator("robot_library.keyframe_pose", text="Keyframe", icon="KEY_HLT")
+    keyframe_operator.root_name = root.name
 
 
 def _viewport_hit(event: bpy.types.Event) -> Vector | None:
@@ -439,7 +466,12 @@ class ROBOT_OT_add(Operator):
         if self.robot_index < 0 or self.robot_index >= len(items):
             self.report({"WARNING"}, "Select a robot arm first")
             return {"CANCELLED"}
-        _place_robot(items[self.robot_index], _add_location(context.scene))
+        item = items[self.robot_index]
+        root = _place_robot(item, _add_location(context.scene))
+        self.report(
+            {"INFO"},
+            f"{item.name}: {root.get('joint_count', 0)} joints, {root.get('collision_count', 0)} collision geoms",
+        )
         return {"FINISHED"}
 
 
@@ -473,7 +505,12 @@ class ROBOT_OT_drag(Operator):
             if location is None:
                 self.report({"WARNING"}, "Release over a 3D viewport")
                 return {"CANCELLED"}
-            _place_robot(context.scene.robot_library[self.robot_index], location)
+            item = context.scene.robot_library[self.robot_index]
+            root = _place_robot(item, location)
+            self.report(
+                {"INFO"},
+                f"{item.name}: {root.get('joint_count', 0)} joints, {root.get('collision_count', 0)} collision geoms",
+            )
             return {"FINISHED"}
         return {"RUNNING_MODAL"}
 
@@ -521,6 +558,31 @@ class ROBOT_OT_keyframe_pose(Operator):
             return {"CANCELLED"}
         for joint in _joint_controls(root):
             joint.keyframe_insert(data_path='["qpos"]', frame=context.scene.frame_current)
+        return {"FINISHED"}
+
+
+class ROBOT_OT_joint_window(Operator):
+    bl_idname = "robot_library.joint_window"
+    bl_label = "Robot Joint Controller"
+
+    root_name: StringProperty()
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        root = _control_root(context)
+        if root is None:
+            self.report({"WARNING"}, "Import or select a compiled MuJoCo robot first")
+            return {"CANCELLED"}
+        self.root_name = root.name
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context: bpy.types.Context) -> None:
+        root = bpy.data.objects.get(self.root_name)
+        if root is None:
+            self.layout.label(text="Robot is no longer available", icon="ERROR")
+            return
+        _draw_joint_controls(self.layout, root, _joint_controls(root))
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
         return {"FINISHED"}
 
 
@@ -599,28 +661,36 @@ class ROBOT_PT_library(Panel):
         layout.label(text=item.model_path or "No model path; placeholder will be used", icon="FILE")
         if item.category:
             layout.label(text=item.category.replace("_", " ").title(), icon="OUTLINER_OB_ARMATURE")
-        layout.prop(scene, "robot_library_auto_spread", text="Auto-space Add")
+        options_box = layout.box()
+        options_box.label(text="Import Options")
+        options_box.prop(scene, "robot_library_auto_spread", text="Auto-space Add")
+        options_box.prop(scene, "robot_library_include_collisions", text="Load Collision Geoms")
         add_row = layout.row(align=True)
         add_operator = add_row.operator("robot_library.add_robot", text="Add to World", icon="ADD")
         add_operator.robot_index = scene.robot_library_index
         drag_operator = add_row.operator("robot_library.drag_robot", text="Drag into Viewport", icon="HAND")
         drag_operator.robot_index = scene.robot_library_index
+        layout.operator("robot_library.joint_window", text="Open Joint Controller", icon="CONSTRAINT_BONE")
 
-        robot_root = _selected_robot_root(context.active_object)
-        if robot_root is None or robot_root.get("import_mode") != "mujoco_compiled":
+
+class ROBOT_PT_joint_controls(Panel):
+    bl_label = "Joint Controls"
+    bl_idname = "ROBOT_PT_joint_controls"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Robot Joints"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        robot_root = _control_root(context)
+        if robot_root is None:
+            layout.label(text="Import or select a robot", icon="INFO")
             return
         controls = _joint_controls(robot_root)
         if not controls:
+            layout.label(text="No hinge or slide joints", icon="INFO")
             return
-        joint_box = layout.box()
-        joint_box.label(text=f"Joint Controls: {robot_root.name}", icon="CONSTRAINT_BONE")
-        for joint in controls:
-            joint_box.prop(joint, '["qpos"]', text=joint.name.removeprefix("Joint: "), slider=True)
-        action_row = joint_box.row(align=True)
-        reset_operator = action_row.operator("robot_library.reset_pose", text="Reset", icon="LOOP_BACK")
-        reset_operator.root_name = robot_root.name
-        keyframe_operator = action_row.operator("robot_library.keyframe_pose", text="Keyframe", icon="KEY_HLT")
-        keyframe_operator.root_name = robot_root.name
+        _draw_joint_controls(layout, robot_root, controls)
 
 
 CLASSES = (
@@ -631,13 +701,15 @@ CLASSES = (
     ROBOT_OT_clear_filter,
     ROBOT_OT_reset_pose,
     ROBOT_OT_keyframe_pose,
+    ROBOT_OT_joint_window,
     ROBOT_UL_library,
     ROBOT_PT_library,
+    ROBOT_PT_joint_controls,
 )
 
 
 def _remove_scene_properties() -> None:
-    for name in ("robot_library", "robot_library_index", "robot_library_status", "robot_library_filter", "robot_setup_path", "robot_library_auto_spread"):
+    for name in ("robot_library", "robot_library_index", "robot_library_status", "robot_library_filter", "robot_setup_path", "robot_library_auto_spread", "robot_library_include_collisions", "robot_library_control_root"):
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
 
@@ -666,6 +738,8 @@ def register() -> None:
     bpy.types.Scene.robot_library_index = IntProperty(name="Robot", default=0, min=0)
     bpy.types.Scene.robot_library = CollectionProperty(type=RobotLibraryItem)
     bpy.types.Scene.robot_library_auto_spread = BoolProperty(name="Auto-space Add", default=True)
+    bpy.types.Scene.robot_library_include_collisions = BoolProperty(name="Load Collision Geoms", default=False)
+    bpy.types.Scene.robot_library_control_root = PointerProperty(name="Controlled Robot", type=bpy.types.Object)
 
 
 def unregister() -> None:

@@ -68,6 +68,39 @@ def _primitive_object(model, geom_id: int, name: str) -> bpy.types.Object | None
         bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=16, radius=1.0)
         obj = bpy.context.object
         obj.scale = (size[0], size[0], size[0])
+    elif geom_type == 3:
+        import bmesh
+
+        mesh = bpy.data.meshes.new(name=f"{name} Mesh")
+        geometry = bmesh.new()
+        radius, half_length = size[0], size[1]
+        bmesh.ops.create_uvsphere(
+            geometry,
+            u_segments=24,
+            v_segments=12,
+            radius=radius,
+            matrix=Matrix.Translation((0.0, 0.0, half_length)),
+        )
+        bmesh.ops.create_uvsphere(
+            geometry,
+            u_segments=24,
+            v_segments=12,
+            radius=radius,
+            matrix=Matrix.Translation((0.0, 0.0, -half_length)),
+        )
+        if half_length > 0:
+            bmesh.ops.create_cone(
+                geometry,
+                cap_ends=False,
+                cap_tris=False,
+                segments=24,
+                radius1=radius,
+                radius2=radius,
+                depth=2.0 * half_length,
+            )
+        geometry.to_mesh(mesh)
+        geometry.free()
+        obj = bpy.data.objects.new(name, mesh)
     elif geom_type == 4:
         bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=16, radius=1.0)
         obj = bpy.context.object
@@ -114,7 +147,12 @@ def _add_qpos_driver(motion_object: bpy.types.Object, joint_object: bpy.types.Ob
     driver.expression = f"qpos - ({home_value:.17g})"
 
 
-def import_compiled_mjcf(path: Path, root: bpy.types.Object, collection: bpy.types.Collection) -> list[bpy.types.Object]:
+def import_compiled_mjcf(
+    path: Path,
+    root: bpy.types.Object,
+    collection: bpy.types.Collection,
+    include_collisions: bool = False,
+) -> list[bpy.types.Object]:
     mujoco = _load_mujoco()
     model = mujoco.MjModel.from_xml_path(str(path))
     data = mujoco.MjData(model)
@@ -194,8 +232,11 @@ def import_compiled_mjcf(path: Path, root: bpy.types.Object, collection: bpy.typ
 
     mesh_cache: dict[int, bpy.types.Mesh] = {}
     material_cache: dict[tuple[float, ...], bpy.types.Material] = {}
+    collision_count = 0
     for geom_id in range(model.ngeom):
-        if int(model.geom_group[geom_id]) == 3:
+        geom_group = int(model.geom_group[geom_id])
+        is_collision = geom_group in {3, 4}
+        if is_collision and not include_collisions:
             continue
         geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or f"geom_{geom_id}"
         geom_type = int(model.geom_type[geom_id])
@@ -218,10 +259,17 @@ def import_compiled_mjcf(path: Path, root: bpy.types.Object, collection: bpy.typ
         if geom_type != int(mujoco.mjtGeom.mjGEOM_MESH):
             obj.scale = primitive_scale
         obj["mujoco_geom_id"] = geom_id
+        obj["is_collision"] = is_collision
+        if is_collision:
+            obj.display_type = "WIRE"
+            obj.hide_render = True
+            obj.color = (1.0, 0.05, 0.05, 0.35)
+            collision_count += 1
         imported.append(obj)
 
     root["import_mode"] = "mujoco_compiled"
     root["mujoco_version"] = mujoco.__version__
     root["body_count"] = model.nbody - 1
     root["joint_count"] = model.njnt
+    root["collision_count"] = collision_count
     return imported
