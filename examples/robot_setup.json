@@ -1,0 +1,22 @@
+{
+  "robots": [
+    {
+      "id": "ur5e",
+      "name": "UR5e",
+      "model_path": "assets/ur5e.xml",
+      "description": "Universal Robots UR5e arm"
+    },
+    {
+      "id": "franka_panda",
+      "name": "Franka Panda",
+      "model_path": "assets/franka_panda.xml",
+      "description": "Franka Emika Panda arm"
+    },
+    {
+      "id": "xarm7",
+      "name": "UFACTORY xArm 7",
+      "model_path": "assets/xarm7.xml",
+      "description": "Seven-axis xArm setup"
+    }
+  ]
+}

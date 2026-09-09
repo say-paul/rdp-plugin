@@ -1,0 +1,22 @@
+{
+  "robots": [
+    {
+      "id": "demo_ur5e",
+      "name": "Demo UR5e",
+      "model_path": "builtin://demo_ur5e",
+      "description": "Built-in placeholder for testing the library"
+    },
+    {
+      "id": "demo_panda",
+      "name": "Demo Franka Panda",
+      "model_path": "builtin://demo_panda",
+      "description": "Built-in placeholder for testing the library"
+    },
+    {
+      "id": "demo_xarm7",
+      "name": "Demo xArm 7",
+      "model_path": "builtin://demo_xarm7",
+      "description": "Built-in placeholder for testing the library"
+    }
+  ]
+}

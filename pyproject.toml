@@ -1,0 +1,8 @@
+[project]
+name = "caryam-robot-arm-library"
+version = "0.1.0"
+description = "Blender add-on for discovering and placing MuJoCo robot arms"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
