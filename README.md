@@ -4,6 +4,14 @@ This Blender add-on discovers robot arms from a `deep_mind/mujoco_manager/robot_
 
 ## Install
 
+Create the Blender add-on archive from the repository root:
+
+```bash
+make zip
+```
+
+This creates `robot_arm_library.zip` for the Blender installation steps below.
+
 1. In Blender, open **Edit > Preferences > Add-ons > Install**.
 2. Select `robot_arm_library.zip` from this repository.
 3. Enable **MuJoCo Robot Arm Library**.
