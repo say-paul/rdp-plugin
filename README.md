@@ -29,11 +29,27 @@ Each item has two placement modes:
 
 MuJoCo XML entries are compiled with the official MuJoCo Python package when available. Blender geometry is built from the compiled mesh vertices and faces, body and geom poses come from MuJoCo forward kinematics, and joint markers use MuJoCo's compiled anchors and axes. The add-on adds the Python user-site directory automatically, allowing Blender to use an existing `pip install mujoco`. The hand-written XML importer remains a fallback when MuJoCo is unavailable.
 
-For authoritative scale and joint placement, install MuJoCo for the system Python used alongside Blender:
+For authoritative scale and joint placement, install MuJoCo 3.2 or newer for the Python used alongside Blender:
 
 ```bash
-python -m pip install --user mujoco
+python -m pip install --user "mujoco>=3.2"
 ```
+
+## Export and render a world
+
+After placing one or more XML-backed robots, use **Export** or **Render** in the **MuJoCo World** section of the Robot Library tab. The add-on writes three files next to the selected XML path:
+
+- `world.xml` composes the imported MJCF models with MuJoCo's `attach` element and preserves their Blender world transforms.
+- `world.json` records the current hinge and slide qpos values.
+- `render_world.py` applies those qpos values and opens the MuJoCo passive viewer.
+
+The **MuJoCo Python** field controls which Python executable launches the renderer. The composed world uses MuJoCo 3.2+'s model attachment API; the original MJCF and its assets remain external files, so keep their relative paths valid after export.
+
+## Behavior-driven flow editor
+
+Use **Open Behavior Editor** to switch the current area to the **Caryam Flow** node editor. The starter graph contains **Start -> Virtual Sensor -> AI Model -> Robot Action -> End**. Add nodes from the sidebar, connect them in the node view, and save/load the graph as JSON.
+
+Virtual Sensor nodes can read `joint.qpos` or a Blender custom property using `object:ObjectName.property`. Robot Action nodes select an imported robot ID and joint name from the existing robot library metadata. The built-in `rule_based` AI node passes its input through as a deterministic test adapter; a later adapter can call an external model without changing the graph file format.
 
 ## Joint controls and animation
 
