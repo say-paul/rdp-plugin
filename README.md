@@ -45,7 +45,7 @@ python -m pip install --user "mujoco>=3.2"
 
 ## Export and render a world
 
-After placing one or more XML-backed robots, use **Export** or **Render** in the **MuJoCo World** section of the Robot Library tab. The add-on writes three files next to the selected XML path:
+After placing one or more XML-backed robots, use **Export** or **Render** in the **MuJoCo Sim** panel under the **MuJoCo World Simulation** sidebar tab. Joint posing is available in the **Joints** panel under **Robot Control**. The add-on writes three files next to the selected XML path:
 
 - `world.xml` composes the imported MJCF models with MuJoCo's `attach` element and preserves their Blender world transforms.
 - `world.json` records the current hinge and slide qpos values.

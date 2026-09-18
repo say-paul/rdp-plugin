@@ -1,4 +1,4 @@
-"""Blender add-on for discovering and placing MuJoCo robot arms."""
+"""Blender add-on for discovering and placing Robot Library."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from .world_exporter import RobotInstance, write_world_export
 bl_info = {
     "name": "MuJoCo Robot Arm Library",
     "author": "Caryam",
-    "version": (0, 8, 0),
+    "version": (0, 8, 6),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Robot Library",
     "description": "Discover robot arms from a MuJoCo setup and drag them into the scene",
@@ -204,7 +204,7 @@ def _refresh_library(scene: bpy.types.Scene) -> None:
     scene.robot_library.clear()
     try:
         definitions = discover_robot_definitions(setup_path)
-    except OSError as error:
+    except Exception as error:
         scene.robot_library_status = f"Cannot read setup: {error}"
         return
 
@@ -223,6 +223,13 @@ def _refresh_library(scene: bpy.types.Scene) -> None:
     else:
         scene.robot_library_status = f"No robot arms found in {setup_path}"
         scene.robot_library_index = 0
+
+
+def _refresh_active_library() -> None:
+    scene = getattr(bpy.context, "scene", None)
+    if scene is not None and hasattr(scene, "robot_library"):
+        _refresh_library(scene)
+    return None
 
 
 def _asset_path(item: RobotLibraryItem) -> Path | None:
@@ -403,9 +410,9 @@ def _import_mjcf_meshes(path: Path) -> list[bpy.types.Object]:
 
 
 def _robot_collection() -> bpy.types.Collection:
-    collection = bpy.data.collections.get("MuJoCo Robot Arms")
+    collection = bpy.data.collections.get("Robot Library")
     if collection is None:
-        collection = bpy.data.collections.new("MuJoCo Robot Arms")
+        collection = bpy.data.collections.new("Robot Library")
         bpy.context.scene.collection.children.link(collection)
     return collection
 
@@ -438,7 +445,7 @@ def _add_location(scene: bpy.types.Scene) -> Vector:
     origin = scene.cursor.location.copy()
     if not scene.robot_library_auto_spread:
         return origin
-    collection = bpy.data.collections.get("MuJoCo Robot Arms")
+    collection = bpy.data.collections.get("Robot Library")
     if collection is None:
         return origin
     placed_count = sum(obj.type == "EMPTY" and "robot_id" in obj for obj in collection.objects)
@@ -501,7 +508,7 @@ def _place_robot(item: RobotLibraryItem, location: Vector) -> bpy.types.Object:
 
 
 def _world_robot_instances() -> list[RobotInstance]:
-    collection = bpy.data.collections.get("MuJoCo Robot Arms")
+    collection = bpy.data.collections.get("Robot Library")
     if collection is None:
         return []
     instances: list[RobotInstance] = []
@@ -534,7 +541,7 @@ def _export_world_file(filepath: str) -> tuple[Path, Path, Path]:
 
 
 def _behavior_joint(robot_id: str, joint_name: str) -> bpy.types.Object | None:
-    collection = bpy.data.collections.get("MuJoCo Robot Arms")
+    collection = bpy.data.collections.get("Robot Library")
     if collection is None:
         return None
     for root in collection.objects:
@@ -960,7 +967,7 @@ class ROBOT_UL_library(UIList):
         query = context.scene.robot_library_filter.strip().lower()
         flags = [
             self.bitflag_filter_item
-            if query and query not in f"{item.name} {item.category}".lower()
+            if not query or query in f"{item.name} {item.category}".lower()
             else 0
             for item in items
         ]
@@ -968,7 +975,7 @@ class ROBOT_UL_library(UIList):
 
 
 class ROBOT_PT_library(Panel):
-    bl_label = "MuJoCo Robot Arms"
+    bl_label = "Robot Library"
     bl_idname = "ROBOT_PT_library"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -977,6 +984,11 @@ class ROBOT_PT_library(Panel):
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
         scene = context.scene
+        library = getattr(scene, "robot_library", None)
+        if library is None:
+            layout.label(text="Robot Library is not registered", icon="ERROR")
+            layout.label(text="Disable and re-enable the add-on")
+            return
         path_row = layout.row(align=True)
         path_row.prop(scene, "robot_setup_path", text="Setup")
         path_row.operator("robot_library.refresh", text="", icon="FILE_REFRESH")
@@ -1001,12 +1013,8 @@ class ROBOT_PT_library(Panel):
             rows=4,
         )
         if not scene.robot_library:
-            if scene.robot_library_status == "Refresh to discover robot arms":
-                _refresh_library(scene)
-            if not scene.robot_library:
-                return
-
-        if not scene.robot_library:
+            layout.label(text="No robots available", icon="INFO")
+            layout.operator("robot_library.refresh", text="Refresh Robot Library", icon="FILE_REFRESH")
             return
 
         item = scene.robot_library[scene.robot_library_index]
@@ -1023,21 +1031,25 @@ class ROBOT_PT_library(Panel):
         drag_operator = add_row.operator("robot_library.drag_robot", text="Drag into Viewport", icon="HAND")
         drag_operator.robot_index = scene.robot_library_index
         layout.operator("robot_library.joint_window", text="Open Joint Controller", icon="CONSTRAINT_BONE")
-        simulation_box = layout.box()
-        simulation_box.label(text="MuJoCo World")
-        simulation_box.prop(scene, "robot_mujoco_python", text="Python")
-        simulation_row = simulation_box.row(align=True)
-        simulation_row.operator("robot_library.export_world", text="Export", icon="EXPORT")
-        simulation_row.operator("robot_library.export_and_render", text="Render", icon="PLAY")
-        layout.operator("robot_library.open_behavior_editor", text="Open Behavior Editor", icon="NODETREE")
+
+
+class ROBOT_PT_sensor_library(Panel):
+    bl_label = "Sensor Library"
+    bl_idname = "ROBOT_PT_sensor_library"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Robot Library"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        self.layout.label(text="Sensor library is not configured", icon="INFO")
 
 
 class ROBOT_PT_joint_controls(Panel):
-    bl_label = "Joint Controls"
+    bl_label = "Robot Joints"
     bl_idname = "ROBOT_PT_joint_controls"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Robot Joints"
+    bl_category = "Robot Control"
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
@@ -1052,12 +1064,62 @@ class ROBOT_PT_joint_controls(Panel):
         _draw_joint_controls(layout, robot_root, controls)
 
 
+class ROBOT_PT_mujoco_world(Panel):
+    bl_label = "MuJoCo Sim"
+    bl_idname = "ROBOT_PT_mujoco_world"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "MuJoCo World Simulation"
+    bl_parent_id = "ROBOT_PT_world_simulation"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        scene = context.scene
+        layout.prop(scene, "robot_mujoco_python", text="Python")
+        row = layout.row(align=True)
+        row.operator("robot_library.export_world", text="Export", icon="EXPORT")
+        row.operator("robot_library.export_and_render", text="Render", icon="PLAY")
+
+
+class ROBOT_PT_world_simulation(Panel):
+    bl_label = "MuJoCo World Simulation"
+    bl_idname = "ROBOT_PT_world_simulation"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "MuJoCo World Simulation"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        self.layout.label(text="Export or render the composed world", icon="WORLD")
+
+
+class ROBOT_PT_behavior_graph(Panel):
+    bl_label = "Robot Flow"
+    bl_idname = "ROBOT_PT_behavior_graph"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Robot Control"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        self.layout.operator("robot_library.open_behavior_editor", text="Open Behavior Editor", icon="NODETREE")
+
+
+class ROBOT_PT_rcs_control(Panel):
+    bl_label = "RCS Control"
+    bl_idname = "ROBOT_PT_rcs_control"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Robot Control"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        self.layout.label(text="RCS control is not configured", icon="INFO")
+
+
 class ROBOT_PT_behavior_editor(Panel):
     bl_label = "Caryam Flow"
     bl_idname = "ROBOT_PT_behavior_editor"
     bl_space_type = "NODE_EDITOR"
     bl_region_type = "UI"
-    bl_category = "Caryam Flow"
+    bl_category = "Robot Flow"
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -1100,7 +1162,12 @@ CLASSES = (
     ROBOT_OT_joint_window,
     ROBOT_UL_library,
     ROBOT_PT_library,
+    ROBOT_PT_sensor_library,
     ROBOT_PT_joint_controls,
+    ROBOT_PT_world_simulation,
+    ROBOT_PT_mujoco_world,
+    ROBOT_PT_behavior_graph,
+    ROBOT_PT_rcs_control,
     ROBOT_PT_behavior_editor,
 )
 
@@ -1139,9 +1206,12 @@ def register() -> None:
     bpy.types.Scene.robot_library_control_root = PointerProperty(name="Controlled Robot", type=bpy.types.Object)
     bpy.types.Scene.robot_mujoco_python = StringProperty(name="MuJoCo Python", default="python")
     bpy.types.Scene.robot_behavior_tree = PointerProperty(name="Behavior Graph", type=CaryamBehaviorTree)
+    bpy.app.timers.register(_refresh_active_library, first_interval=0.1)
 
 
 def unregister() -> None:
+    if bpy.app.timers.is_registered(_refresh_active_library):
+        bpy.app.timers.unregister(_refresh_active_library)
     _remove_scene_properties()
     _unregister_existing_classes()
 
