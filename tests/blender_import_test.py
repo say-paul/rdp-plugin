@@ -21,6 +21,7 @@ robot_arm_library.register()
 scene = bpy.context.scene
 menagerie_path = Path.home() / "git_repos" / "mujoco_menagerie"
 scene.robot_setup_path = str(menagerie_path)
+scene.robot_library_mesh_detail = 0.35
 bpy.ops.robot_library.refresh()
 
 piper = next(item for item in scene.robot_library if item.robot_id == "agilex_piper/piper")
@@ -29,6 +30,8 @@ mesh_objects = [obj for obj in bpy.data.objects if obj.type == "MESH" and obj.na
 assert len(mesh_objects) > 10, f"Expected detailed Piper geometry, got {len(mesh_objects)} mesh objects"
 assert root["import_mode"] == "mujoco_compiled"
 assert root["joint_count"] == 8
+assert abs(root["mesh_detail"] - 0.35) < 1e-6
+assert root["triangle_count"] < root["source_triangle_count"]
 
 import mujoco
 
@@ -42,10 +45,7 @@ sample_geom = mesh_objects[0]
 geom_id = sample_geom["mujoco_geom_id"]
 expected_position = Vector(tuple(float(value) for value in data.geom_xpos[geom_id]))
 assert (sample_geom.matrix_world.translation - expected_position).length < 1e-6
-mesh_id = int(model.geom_dataid[geom_id])
-vertex_address = int(model.mesh_vertadr[mesh_id])
-expected_vertex = Vector(tuple(float(value) for value in model.mesh_vert[vertex_address]))
-assert (sample_geom.data.vertices[0].co - expected_vertex).length < 1e-6
+assert len(sample_geom.data.vertices) > 0
 
 sample_joint = next(obj for obj in bpy.data.objects if obj.name.startswith("Joint:"))
 joint_id = sample_joint["mujoco_joint_id"]

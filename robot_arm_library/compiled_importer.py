@@ -11,6 +11,8 @@ from types import ModuleType
 import bpy
 from mathutils import Matrix, Vector
 
+from .mesh_simplifier import SOURCE_TRIANGLE_COUNT_PROPERTY, mesh_triangle_count, simplify_mesh_data
+
 
 def _load_mujoco() -> ModuleType:
     try:
@@ -44,7 +46,13 @@ def _material(model, geom_id: int, cache: dict[tuple[float, ...], bpy.types.Mate
     return material
 
 
-def _mesh_data(model, mesh_id: int, cache: dict[int, bpy.types.Mesh]) -> bpy.types.Mesh:
+def _mesh_data(
+    model,
+    mesh_id: int,
+    cache: dict[int, bpy.types.Mesh],
+    detail: float,
+    collection: bpy.types.Collection,
+) -> bpy.types.Mesh:
     cached = cache.get(mesh_id)
     if cached is not None:
         return cached
@@ -57,6 +65,7 @@ def _mesh_data(model, mesh_id: int, cache: dict[int, bpy.types.Mesh]) -> bpy.typ
     mesh = bpy.data.meshes.new(name=f"MuJoCo Mesh {mesh_id}")
     mesh.from_pydata(vertices, [], faces)
     mesh.update()
+    mesh = simplify_mesh_data(mesh, detail, collection)
     cache[mesh_id] = mesh
     return mesh
 
@@ -152,7 +161,9 @@ def import_compiled_mjcf(
     root: bpy.types.Object,
     collection: bpy.types.Collection,
     include_collisions: bool = False,
+    mesh_detail: float = 1.0,
 ) -> list[bpy.types.Object]:
+    mesh_detail = max(0.01, min(1.0, mesh_detail))
     mujoco = _load_mujoco()
     model = mujoco.MjModel.from_xml_path(str(path))
     data = mujoco.MjData(model)
@@ -244,7 +255,10 @@ def import_compiled_mjcf(
             mesh_id = int(model.geom_dataid[geom_id])
             if mesh_id < 0:
                 continue
-            obj = bpy.data.objects.new(f"Geom: {geom_name}", _mesh_data(model, mesh_id, mesh_cache))
+            obj = bpy.data.objects.new(
+                f"Geom: {geom_name}",
+                _mesh_data(model, mesh_id, mesh_cache, mesh_detail, collection),
+            )
             collection.objects.link(obj)
         else:
             obj = _primitive_object(model, geom_id, f"Geom: {geom_name}")
@@ -252,6 +266,7 @@ def import_compiled_mjcf(
                 continue
             primitive_scale = obj.scale.copy()
             _move_to_collection(obj, collection)
+            obj.data = simplify_mesh_data(obj.data, mesh_detail, collection)
         obj.data.materials.append(_material(model, geom_id, material_cache))
         body_id = int(model.geom_bodyid[geom_id])
         obj.parent = body_objects.get(body_id, root)
@@ -272,4 +287,11 @@ def import_compiled_mjcf(
     root["body_count"] = model.nbody - 1
     root["joint_count"] = model.njnt
     root["collision_count"] = collision_count
+    root["mesh_detail"] = mesh_detail
+    root["source_triangle_count"] = sum(
+        int(obj.data.get(SOURCE_TRIANGLE_COUNT_PROPERTY, mesh_triangle_count(obj.data)))
+        for obj in imported
+        if obj.type == "MESH"
+    )
+    root["triangle_count"] = sum(mesh_triangle_count(obj.data) for obj in imported if obj.type == "MESH")
     return imported

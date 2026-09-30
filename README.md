@@ -45,11 +45,16 @@ python -m pip install --user "mujoco>=3.2"
 
 ## Export and render a world
 
-After placing one or more XML-backed robots, use **Export** or **Render** in the **MuJoCo Sim** panel under the **MuJoCo World Simulation** sidebar tab. Joint posing is available in the **Joints** panel under **Robot Control**. The add-on writes three files next to the selected XML path:
+After placing one or more XML-backed robots, open the **Sim** sidebar tab. Its **MuJoCo** section provides **Play**, which exports `caryam_world.xml` beside the current Blender file and immediately opens the MuJoCo physics viewer. **Gazebo** is reserved for future simulator support. Use **Export** when you want to choose a different world file path. Joint posing is available in the **Joints** panel under **Robot Control**. The add-on writes companion files beside the chosen world path:
 
 - `world.xml` composes the imported MJCF models with MuJoCo's `attach` element and preserves their Blender world transforms.
 - `world.json` records the current hinge and slide qpos values.
 - `render_world.py` applies those qpos values and opens the MuJoCo passive viewer.
+- `world.usd` is a Blender USD snapshot of the scene for interchange with USD-based tools.
+
+Visible Blender meshes are exported as individual MuJoCo solids. Meshes with an **Active** Blender rigid body, a `mujoco_dynamic` custom property, or a name containing `ball` become free-joint dynamic bodies. Other meshes remain fixed collision geometry, which is appropriate for environment pieces such as stairs.
+Every generated floor and mesh geom explicitly enables MuJoCo collision, and the viewer advances physics in real time so falling and contacts are visible.
+Free-base MJCF robots preserve their Blender root position and rotation, so separately arranged robots spawn with the same spacing in MuJoCo instead of overlapping at world origin.
 
 The **MuJoCo Python** field controls which Python executable launches the renderer. The composed world uses MuJoCo 3.2+'s model attachment API; the original MJCF and its assets remain external files, so keep their relative paths valid after export.
 

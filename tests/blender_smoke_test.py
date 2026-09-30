@@ -46,9 +46,15 @@ assert not getattr(blender_addon.ROBOT_PT_joint_controls, "bl_parent_id", "")
 assert blender_addon.ROBOT_PT_behavior_graph.bl_label == "Robot Flow"
 assert blender_addon.ROBOT_PT_behavior_graph.bl_category == "Robot Control"
 assert not getattr(blender_addon.ROBOT_PT_behavior_graph, "bl_parent_id", "")
-assert blender_addon.ROBOT_PT_mujoco_world.bl_category == "MuJoCo World Simulation"
-assert blender_addon.ROBOT_PT_mujoco_world.bl_label == "MuJoCo Sim"
-assert blender_addon.ROBOT_PT_mujoco_world.bl_parent_id == "ROBOT_PT_world_simulation"
+assert blender_addon.ROBOT_PT_simulation.bl_label == "Sim"
+assert blender_addon.ROBOT_PT_simulation.bl_category == "Sim"
+assert blender_addon.ROBOT_PT_mujoco_world.bl_category == "Sim"
+assert blender_addon.ROBOT_PT_mujoco_world.bl_label == "MuJoCo"
+assert blender_addon.ROBOT_PT_mujoco_world.bl_parent_id == "ROBOT_PT_simulation"
+assert blender_addon.ROBOT_PT_gazebo_world.bl_category == "Sim"
+assert blender_addon.ROBOT_PT_gazebo_world.bl_label == "Gazebo"
+assert blender_addon.ROBOT_PT_gazebo_world.bl_parent_id == "ROBOT_PT_simulation"
+assert blender_addon.ROBOT_OT_launch_mujoco.bl_idname == "robot_library.launch_mujoco"
 assert blender_addon.ROBOT_PT_rcs_control.bl_category == "Robot Control"
 assert not getattr(blender_addon.ROBOT_PT_rcs_control, "bl_parent_id", "")
 
