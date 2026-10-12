@@ -40,6 +40,21 @@ class BehaviorGraphTests(unittest.TestCase):
 
         self.assertIn("Application node has no ports: empty_app", graph.validate())
 
+    def test_virtual_lidar_is_a_typed_point_cloud_component(self):
+        graph = BehaviorGraph(
+            nodes=[
+                BehaviorNode(
+                    "lidar",
+                    "virtual_lidar",
+                    outputs=(PortSpec("point_cloud", data_type="point_cloud2"),),
+                ),
+            ],
+            links=[],
+        )
+
+        self.assertEqual(graph.validate(), [])
+        self.assertEqual(graph.to_dict()["nodes"][0]["kind"], "virtual_lidar")
+
     def test_run_executes_application_node_with_named_ports(self):
         graph = BehaviorGraph(
             nodes=[
@@ -176,18 +191,14 @@ class BehaviorGraphTests(unittest.TestCase):
         self.assertEqual({node.node_id for node in restored.nodes}, {"camera", "image_transform"})
         self.assertEqual(len(restored.links), 1)
 
-    def test_default_graph_runs_sensor_ai_and_action(self):
+    def test_default_graph_is_the_core_sensor_to_command_pipeline(self):
         graph = default_behavior_graph()
-        actions = []
 
-        values = graph.run(
-            lambda data: 0.25,
-            lambda data, context: {"target": context["input"] + 0.5},
-            lambda data, value: actions.append(value),
+        self.assertEqual(
+            [node.kind for node in graph.nodes],
+            ["sensor", "application", "joint_controller", "joint_target"],
         )
-
-        self.assertEqual(values["sensor"], 0.25)
-        self.assertEqual(actions, [{"target": 0.75}])
+        self.assertEqual(graph.validate(), [])
 
     def test_cycles_are_rejected(self):
         graph = BehaviorGraph(
@@ -195,7 +206,7 @@ class BehaviorGraphTests(unittest.TestCase):
             links=[BehaviorLink("a", "b"), BehaviorLink("b", "a")],
         )
 
-        self.assertIn("Behavior graph contains a cycle", graph.validate())
+        self.assertIn("Data graph contains a cycle", graph.validate())
 
     def test_world_export_writes_render_bundle(self):
         with tempfile.TemporaryDirectory() as directory:

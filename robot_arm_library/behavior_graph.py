@@ -1,4 +1,4 @@
-"""Serializable behavior graphs for robot sensors, AI decisions, and actions."""
+"""Serializable data graphs for robot sensors, applications, and commands."""
 
 from __future__ import annotations
 
@@ -9,27 +9,88 @@ from typing import Any, Callable, Iterable
 
 
 GRAPH_VERSION = 1
-NODE_KINDS = {"start", "sensor", "ai_model", "condition", "action", "end", "application"}
+NODE_KINDS = {
+    "start",
+    "stop",
+    "wait",
+    "retry",
+    "success",
+    "failure",
+    "sensor",
+    "application",
+    "virtual_lidar",
+    "virtual_rgb_camera",
+    "virtual_depth_camera",
+    "virtual_imu",
+    "virtual_tactile_array",
+    "ai_model",
+    "joint_controller",
+    "joint_target",
+    "condition",
+    "action",
+    "end",
+}
+APPLICATION_NODE_KINDS = {"application"}
+SENSOR_NODE_KINDS = {
+    "sensor",
+    "virtual_lidar",
+    "virtual_rgb_camera",
+    "virtual_depth_camera",
+    "virtual_imu",
+    "virtual_tactile_array",
+}
+PORT_REQUIRED_NODE_KINDS = APPLICATION_NODE_KINDS | (SENSOR_NODE_KINDS - {"sensor"})
+DELIVERY_MODES = {"stream", "state", "event", "command"}
 
 
 @dataclass(frozen=True)
 class PortSpec:
     name: str
     shape: tuple[int, ...] = ()
+    data_type: str = "any"
+    delivery: str = "stream"
+    requires_timestamp: bool = True
+    requires_validity: bool = True
 
     def compatibility_error(self, target: "PortSpec") -> str | None:
+        if self.data_type != "any" and target.data_type != "any" and self.data_type != target.data_type:
+            return f"Incompatible port types: {self.data_type} -> {target.data_type}"
         if self.shape and target.shape and self.shape != target.shape:
             return f"Incompatible port shapes: {self.shape} -> {target.shape}"
+        if self.delivery not in DELIVERY_MODES:
+            return f"Unsupported delivery mode: {self.delivery}"
+        if target.delivery not in DELIVERY_MODES:
+            return f"Unsupported delivery mode: {target.delivery}"
+        if self.delivery != target.delivery:
+            return f"Incompatible delivery modes: {self.delivery} -> {target.delivery}"
+        if target.requires_timestamp and not self.requires_timestamp:
+            return "Target requires timestamps but source does not provide them"
+        if target.requires_validity and not self.requires_validity:
+            return "Target requires validity but source does not provide it"
         return None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "shape": list(self.shape)}
+        return {
+            "name": self.name,
+            "shape": list(self.shape),
+            "type": self.data_type,
+            "delivery": self.delivery,
+            "requires_timestamp": self.requires_timestamp,
+            "requires_validity": self.requires_validity,
+        }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "PortSpec":
         shape = value.get("shape", [])
         parsed_shape = tuple(int(part) for part in shape) if isinstance(shape, (list, tuple)) else ()
-        return cls(name=str(value.get("name", "")), shape=parsed_shape)
+        return cls(
+            name=str(value.get("name", "")),
+            shape=parsed_shape,
+            data_type=str(value.get("type", "any")),
+            delivery=str(value.get("delivery", "stream")),
+            requires_timestamp=bool(value.get("requires_timestamp", True)),
+            requires_validity=bool(value.get("requires_validity", True)),
+        )
 
 
 @dataclass
@@ -109,7 +170,7 @@ ApplicationRunner = Callable[[BehaviorNode, dict[str, Any]], dict[str, Any]]
 
 @dataclass
 class BehaviorGraph:
-    name: str = "Robot Behavior"
+    name: str = "Robot Data Graph"
     nodes: list[BehaviorNode] = field(default_factory=list)
     links: list[BehaviorLink] = field(default_factory=list)
 
@@ -131,7 +192,7 @@ class BehaviorGraph:
         errors.extend(
             f"Application node has no ports: {node.node_id}"
             for node in self.nodes
-            if node.kind == "application" and not node.inputs and not node.outputs
+            if node.kind in PORT_REQUIRED_NODE_KINDS and not node.inputs and not node.outputs
         )
         node_map = self.node_map()
         known_ids = set(node_ids)
@@ -140,13 +201,13 @@ class BehaviorGraph:
             target_node = node_map.get(link.target)
             if (
                 source_node is not None
-                and source_node.kind == "application"
+                and source_node.outputs
                 and link.source_port not in source_node.output_names()
             ):
                 errors.append(f"Unknown output port '{link.source_port}' on {link.source}")
             if (
                 target_node is not None
-                and target_node.kind == "application"
+                and target_node.inputs
                 and link.target_port not in target_node.input_names()
             ):
                 errors.append(f"Unknown input port '{link.target_port}' on {link.target}")
@@ -176,7 +237,7 @@ class BehaviorGraph:
         return errors
 
     def execution_order(self) -> list[str]:
-        """Return a deterministic topological order for a behavior graph."""
+        """Return a deterministic topological order for a data graph."""
         node_map = self.node_map()
         incoming = {node_id: 0 for node_id in node_map}
         outgoing: dict[str, list[str]] = {node_id: [] for node_id in node_map}
@@ -196,7 +257,7 @@ class BehaviorGraph:
                     ready.append(target)
                     ready.sort()
         if len(order) != len(node_map):
-            raise ValueError("Behavior graph contains a cycle")
+            raise ValueError("Data graph contains a cycle")
         return order
 
     def to_dict(self) -> dict[str, Any]:
@@ -212,7 +273,7 @@ class BehaviorGraph:
         nodes = value.get("nodes", [])
         links = value.get("links", [])
         graph = cls(
-            name=str(value.get("name", "Robot Behavior")),
+            name=str(value.get("name", "Robot Data Graph")),
             nodes=[BehaviorNode.from_dict(node) for node in nodes if isinstance(node, dict)],
             links=[
                 BehaviorLink(
@@ -227,7 +288,7 @@ class BehaviorGraph:
         )
         errors = graph.validate()
         if errors:
-            raise ValueError("Invalid behavior graph: " + "; ".join(errors))
+            raise ValueError("Invalid data graph: " + "; ".join(errors))
         return graph
 
     def save(self, path: str | Path) -> None:
@@ -237,14 +298,14 @@ class BehaviorGraph:
     def load(cls, path: str | Path) -> "BehaviorGraph":
         value = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(value, dict):
-            raise ValueError("Behavior graph JSON must contain an object")
+            raise ValueError("Data graph JSON must contain an object")
         return cls.from_dict(value)
 
     def to_flow_dict(self) -> dict[str, Any]:
         """Convert application nodes into a flow.yaml-shaped mapping."""
         applications: list[dict[str, Any]] = []
         for node in self.nodes:
-            if node.kind != "application":
+            if node.kind not in APPLICATION_NODE_KINDS:
                 continue
             entry: dict[str, Any] = {"name": node.node_id, "type": "python"}
             if node.handler:
@@ -257,7 +318,7 @@ class BehaviorGraph:
 
         dataflow: list[str] = []
         for node in self.nodes:
-            if node.kind != "application":
+            if node.kind not in APPLICATION_NODE_KINDS:
                 continue
             incoming_ports = sorted({link.target_port for link in self.links if link.target == node.node_id})
             outgoing_ports = sorted({link.source_port for link in self.links if link.source == node.node_id})
@@ -360,7 +421,7 @@ class BehaviorGraph:
         """
         errors = self.validate()
         if errors:
-            raise ValueError("Invalid behavior graph: " + "; ".join(errors))
+            raise ValueError("Invalid data graph: " + "; ".join(errors))
         node_map = self.node_map()
         predecessors: dict[str, list[str]] = {node_id: [] for node_id in node_map}
         port_links: dict[str, list[BehaviorLink]] = {node_id: [] for node_id in node_map}
@@ -375,8 +436,12 @@ class BehaviorGraph:
             inputs = [values[source] for source in predecessors[node_id] if source in values]
             if node.kind in {"start", "end"}:
                 values[node_id] = inputs[0] if inputs else None
-            elif node.kind == "sensor":
+            elif node.kind in SENSOR_NODE_KINDS:
                 values[node_id] = sensor_reader(node.data)
+                if isinstance(values[node_id], dict):
+                    port_outputs[node_id] = values[node_id]
+                else:
+                    port_outputs[node_id] = {port.name: values[node_id] for port in node.outputs}
             elif node.kind == "ai_model":
                 if ai_runner is None:
                     raise ValueError(f"No AI runner configured for node: {node_id}")
@@ -389,7 +454,7 @@ class BehaviorGraph:
                 if action_sink is not None:
                     action_sink(node.data, action_input)
                 values[node_id] = action_input
-            elif node.kind == "application":
+            elif node.kind in APPLICATION_NODE_KINDS:
                 if application_runner is None:
                     raise ValueError(f"No application runner configured for node: {node_id}")
                 named_inputs = {
@@ -401,23 +466,56 @@ class BehaviorGraph:
                 outputs = application_runner(node, named_inputs)
                 port_outputs[node_id] = dict(outputs)
                 values[node_id] = outputs
+            elif node.kind in {"joint_controller", "joint_target", "wait", "retry", "success", "failure"}:
+                values[node_id] = inputs[-1] if inputs else None
+            elif node.kind == "stop":
+                values[node_id] = None
         return values
 
 
 def default_behavior_graph() -> BehaviorGraph:
-    """Create a useful starter graph for the Blender node editor."""
+    """Create a useful starter data graph for the Blender node editor."""
     return BehaviorGraph(
+        name="Core Simulation Flow",
         nodes=[
-            BehaviorNode("start", "start", "Start", position=(-420.0, 0.0)),
-            BehaviorNode("sensor", "sensor", "Virtual Sensor", {"sensor": "joint.qpos"}, (-180.0, 0.0)),
-            BehaviorNode("ai", "ai_model", "AI Model", {"model": "rule_based"}, (60.0, 0.0)),
-            BehaviorNode("action", "action", "Robot Action", {"robot_id": "", "joint": "", "target": 0.0}, (300.0, 0.0)),
-            BehaviorNode("end", "end", "End", position=(540.0, 0.0)),
+            BehaviorNode("sensor", "sensor", "Sensor", {"sensor": "joint.qpos"}, (-360.0, 0.0)),
+            BehaviorNode(
+                "application",
+                "application",
+                "Application / Model",
+                position=(-120.0, 0.0),
+                inputs=(PortSpec("value"),),
+                outputs=(PortSpec("target", data_type="joint_positions"),),
+            ),
+            BehaviorNode(
+                "joint_controller",
+                "joint_controller",
+                "Joint Controller",
+                position=(120.0, 0.0),
+                inputs=(PortSpec("target", data_type="joint_positions"),),
+                outputs=(PortSpec("joint_target", data_type="joint_target", delivery="command"),),
+            ),
+            BehaviorNode(
+                "joint_target",
+                "joint_target",
+                "Joint Target",
+                position=(360.0, 0.0),
+                inputs=(PortSpec("joint_target", data_type="joint_target", delivery="command"),),
+                outputs=(PortSpec("joint_target", data_type="joint_target", delivery="command"),),
+            ),
         ],
         links=[
-            BehaviorLink("start", "sensor"),
-            BehaviorLink("sensor", "ai"),
-            BehaviorLink("ai", "action"),
-            BehaviorLink("action", "end"),
+            BehaviorLink("sensor", "application", "value", "value"),
+            BehaviorLink("application", "joint_controller", "target", "target"),
+            BehaviorLink("joint_controller", "joint_target", "joint_target", "joint_target"),
         ],
     )
+
+
+# New integrations should use the data-flow names. The original symbols remain
+# available so existing saved projects and external scripts continue to work.
+DataPort = PortSpec
+DataNode = BehaviorNode
+DataLink = BehaviorLink
+DataGraph = BehaviorGraph
+default_data_graph = default_behavior_graph
