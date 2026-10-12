@@ -6,9 +6,11 @@ import math
 import json
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
@@ -34,6 +36,17 @@ bl_info = {
 
 DEFAULT_SETUP_PATH = str(Path.home() / "git_repos" / "mujoco_menagerie")
 SUPPORTED_IMPORT_EXTENSIONS = {".blend", ".dae", ".fbx", ".glb", ".gltf", ".obj", ".ply", ".stl", ".xml"}
+TYPED_DATA_NODE_KINDS = {
+    "application",
+    "virtual_lidar",
+    "virtual_rgb_camera",
+    "virtual_depth_camera",
+    "virtual_imu",
+    "virtual_tactile_array",
+    "joint_controller",
+    "joint_target",
+}
+PORT_CONFIGURABLE_NODE_KINDS = {"application"}
 
 
 class RobotLibraryItem(PropertyGroup):
@@ -48,7 +61,7 @@ class RobotLibraryItem(PropertyGroup):
 
 class CaryamBehaviorTree(NodeTree):
     bl_idname = "CARYAM_BEHAVIOR_TREE"
-    bl_label = "Caryam Behavior Graph"
+    bl_label = "Caryam Data Graph"
     bl_icon = "NODETREE"
 
     def update(self) -> None:
@@ -58,7 +71,7 @@ class CaryamBehaviorTree(NodeTree):
             target = link.to_node
             if not isinstance(source, CaryamBehaviorNode) or not isinstance(target, CaryamBehaviorNode):
                 continue
-            if source.kind != "application" or target.kind != "application":
+            if source.kind not in TYPED_DATA_NODE_KINDS or target.kind not in TYPED_DATA_NODE_KINDS:
                 continue
             source_port = next((port for port in source.output_ports if port.port_name == link.from_socket.name), None)
             target_port = next((port for port in target.input_ports if port.port_name == link.to_socket.name), None)
@@ -77,6 +90,34 @@ class CaryamPortSpec(PropertyGroup):
         default="",
         description="Comma-separated tensor shape, e.g. 1,3,480,640",
     )
+    data_type: EnumProperty(
+        name="Type",
+        items=(
+            ("any", "Any", "Any serializable value"),
+            ("image", "Image", "Image tensor or frame"),
+            ("joint_state", "Joint State", "Current joint positions"),
+            ("joint_positions", "Joint Positions", "Requested joint positions"),
+            ("joint_target", "Joint Target", "Validated controller command"),
+            ("pose", "Pose", "Position and orientation"),
+            ("boolean", "Boolean", "Boolean state"),
+            ("point_cloud2", "ROS PointCloud2", "sensor_msgs/PointCloud2 scan"),
+            ("image_rgb8", "RGB8 Image", "sensor_msgs/Image encoded as rgb8"),
+            ("image_depth32f", "Depth Image", "sensor_msgs/Image encoded as 32FC1"),
+            ("imu", "IMU", "sensor_msgs/Imu"),
+            ("tactile_array", "Tactile Array", "Per-cell tactile contact values"),
+        ),
+        default="any",
+    )
+    delivery: EnumProperty(
+        name="Mode",
+        items=(
+            ("stream", "Stream", "Continuous sensor or application values"),
+            ("state", "State", "Most recent state value"),
+            ("event", "Event", "Discrete event"),
+            ("command", "Command", "Validated command proposal"),
+        ),
+        default="stream",
+    )
 
     def shape_tuple(self) -> tuple[int, ...]:
         if not self.shape_csv.strip():
@@ -86,25 +127,52 @@ class CaryamPortSpec(PropertyGroup):
         except ValueError:
             return ()
 
+    def to_spec(self) -> PortSpec:
+        return PortSpec(self.port_name, self.shape_tuple(), self.data_type, self.delivery)
+
 
 class CaryamBehaviorNode(Node):
     bl_idname = "CARYAM_BEHAVIOR_NODE"
-    bl_label = "Behavior Node"
+    bl_label = "Data Node"
 
     node_id: StringProperty(name="Id", default="node")
 
     def _on_kind_update(self, context: bpy.types.Context) -> None:
         self.sync_sockets()
 
+    def _on_camera_resolution_update(self, context: bpy.types.Context) -> None:
+        output_name = "rgb_image" if self.kind == "virtual_rgb_camera" else "depth_image"
+        channels = 3 if self.kind == "virtual_rgb_camera" else 1
+        output = next((port for port in self.output_ports if port.port_name == output_name), None)
+        if output is not None:
+            output.shape_csv = f"1,{channels},{self.camera_height},{self.camera_width}"
+
+    def camera_output_label(self) -> str:
+        if self.kind == "virtual_rgb_camera":
+            return f"Output: rgb_image [3X{self.camera_width}X{self.camera_height}] (RGB8)"
+        return f"Output: depth_image [1X{self.camera_width}X{self.camera_height}] (32FC1)"
+
     kind: EnumProperty(
         name="Kind",
         items=(
             ("start", "Start", "Begin execution"),
+            ("stop", "Stop", "Stop the data flow"),
+            ("wait", "Wait", "Wait for the next data-flow tick"),
+            ("retry", "Retry", "Retry on a later data-flow tick"),
+            ("success", "Success", "Mark the current control branch successful"),
+            ("failure", "Failure", "Mark the current control branch failed"),
             ("sensor", "Virtual Sensor", "Read a Blender or MuJoCo value"),
             ("ai_model", "AI Model", "Transform sensor data into a decision"),
+            ("joint_controller", "Joint Controller", "Validate requested robot joint positions"),
+            ("joint_target", "Joint Target", "Publish a validated joint command"),
             ("condition", "Condition", "Evaluate a boolean value"),
             ("action", "Robot Action", "Write a robot joint command"),
             ("application", "Application", "A named application with typed input and output ports"),
+            ("virtual_lidar", "Virtual Lidar", "Emit a ROS PointCloud2 scan"),
+            ("virtual_rgb_camera", "RGB Camera", "Emit a fixed RGB image stream"),
+            ("virtual_depth_camera", "Depth Camera", "Emit a fixed depth image stream"),
+            ("virtual_imu", "IMU", "Emit acceleration and angular velocity"),
+            ("virtual_tactile_array", "Tactile Array", "Emit tactile contact readings"),
             ("end", "End", "Finish execution"),
         ),
         default="sensor",
@@ -115,12 +183,27 @@ class CaryamBehaviorNode(Node):
     robot_id: StringProperty(name="Robot")
     joint_name: StringProperty(name="Joint")
     target: FloatProperty(name="Target", default=0.0)
+    lidar_max_range_m: FloatProperty(name="Max Range (m)", default=10.0, min=0.01)
+    lidar_samples: IntProperty(name="Horizontal Samples", default=360, min=1)
+    sensor_mount_frame: StringProperty(name="Mount Frame", default="")
+    sensor_rate_hz: FloatProperty(name="Rate (Hz)", default=30.0, min=0.1)
+    camera_width: IntProperty(name="Width", default=640, min=1, update=_on_camera_resolution_update)
+    camera_height: IntProperty(name="Height", default=480, min=1, update=_on_camera_resolution_update)
+    camera_fov_degrees: FloatProperty(name="Vertical FOV", default=60.0, min=1.0, max=179.0)
+    depth_min_m: FloatProperty(name="Min Depth (m)", default=0.1, min=0.0)
+    depth_max_m: FloatProperty(name="Max Depth (m)", default=10.0, min=0.01)
+    imu_accel_noise: FloatProperty(name="Accel Noise", default=0.0, min=0.0)
+    imu_gyro_noise: FloatProperty(name="Gyro Noise", default=0.0, min=0.0)
+    imu_include_magnetometer: BoolProperty(name="Include Magnetometer", default=False)
+    tactile_geom: StringProperty(name="Target Geom", default="")
+    tactile_mesh: StringProperty(name="Tactile Mesh", default="")
+    tactile_threshold: FloatProperty(name="Contact Threshold", default=0.0, min=0.0)
     handler: StringProperty(name="Handler", default="")
     input_ports: CollectionProperty(type=CaryamPortSpec)
     output_ports: CollectionProperty(type=CaryamPortSpec)
 
     def sync_sockets(self) -> None:
-        if self.kind == "application":
+        if self.kind in TYPED_DATA_NODE_KINDS:
             wanted_inputs = [port.port_name for port in self.input_ports if port.port_name]
             wanted_outputs = [port.port_name for port in self.output_ports if port.port_name]
         else:
@@ -148,7 +231,9 @@ class CaryamBehaviorNode(Node):
         return self.label or self.kind.replace("_", " ").title()
 
     def draw_buttons(self, context: bpy.types.Context, layout: bpy.types.UILayout) -> None:
-        layout.prop(self, "kind", text="")
+        header = layout.row(align=True)
+        remove = header.operator("robot_library.delete_data_node", text="", icon="TRASH")
+        remove.node_name = self.name
         if self.kind == "sensor":
             layout.prop(self, "sensor_path")
         elif self.kind == "ai_model":
@@ -157,7 +242,37 @@ class CaryamBehaviorNode(Node):
             layout.prop(self, "robot_id")
             layout.prop(self, "joint_name")
             layout.prop(self, "target")
-        elif self.kind == "application":
+        elif self.kind == "virtual_lidar":
+            layout.prop(self, "lidar_max_range_m")
+            layout.prop(self, "lidar_samples")
+            layout.label(text="Output: point_cloud (ROS PointCloud2)")
+        elif self.kind in {"virtual_rgb_camera", "virtual_depth_camera"}:
+            layout.prop(self, "sensor_mount_frame")
+            size = layout.row(align=True)
+            size.prop(self, "camera_width")
+            size.prop(self, "camera_height")
+            layout.prop(self, "camera_fov_degrees")
+            layout.prop(self, "sensor_rate_hz")
+            if self.kind == "virtual_depth_camera":
+                layout.prop(self, "depth_min_m")
+                layout.prop(self, "depth_max_m")
+                layout.label(text=self.camera_output_label())
+            else:
+                layout.label(text=self.camera_output_label())
+        elif self.kind == "virtual_imu":
+            layout.prop(self, "sensor_mount_frame")
+            layout.prop(self, "sensor_rate_hz")
+            layout.prop(self, "imu_accel_noise")
+            layout.prop(self, "imu_gyro_noise")
+            layout.prop(self, "imu_include_magnetometer")
+            layout.label(text="Output: imu (sensor_msgs/Imu)")
+        elif self.kind == "virtual_tactile_array":
+            layout.prop(self, "tactile_geom")
+            layout.prop(self, "tactile_mesh")
+            layout.prop(self, "sensor_rate_hz")
+            layout.prop(self, "tactile_threshold")
+            layout.label(text="Output: tactile_array")
+        elif self.kind in TYPED_DATA_NODE_KINDS:
             layout.prop(self, "handler")
             columns = layout.row()
             input_column = columns.column()
@@ -166,6 +281,8 @@ class CaryamBehaviorNode(Node):
                 port_row = input_column.row(align=True)
                 port_row.prop(port, "port_name", text="")
                 port_row.prop(port, "shape_csv", text="")
+                port_row.prop(port, "data_type", text="")
+                port_row.prop(port, "delivery", text="")
                 remove = port_row.operator("robot_library.remove_behavior_port", text="", icon="X")
                 remove.direction = "input"
                 remove.port_index = index
@@ -178,6 +295,8 @@ class CaryamBehaviorNode(Node):
                 port_row = output_column.row(align=True)
                 port_row.prop(port, "port_name", text="")
                 port_row.prop(port, "shape_csv", text="")
+                port_row.prop(port, "data_type", text="")
+                port_row.prop(port, "delivery", text="")
                 remove = port_row.operator("robot_library.remove_behavior_port", text="", icon="X")
                 remove.direction = "output"
                 remove.port_index = index
@@ -200,6 +319,34 @@ def _node_data(node: CaryamBehaviorNode) -> dict[str, object]:
         return {"model": node.model_name}
     if node.kind == "action":
         return {"robot_id": node.robot_id, "joint": node.joint_name, "target": node.target}
+    if node.kind == "virtual_lidar":
+        return {"max_range_m": node.lidar_max_range_m, "horizontal_samples": node.lidar_samples}
+    if node.kind in {"virtual_rgb_camera", "virtual_depth_camera"}:
+        data: dict[str, object] = {
+            "mount_frame": node.sensor_mount_frame,
+            "width": node.camera_width,
+            "height": node.camera_height,
+            "vertical_fov_degrees": node.camera_fov_degrees,
+            "rate_hz": node.sensor_rate_hz,
+        }
+        if node.kind == "virtual_depth_camera":
+            data.update({"min_depth_m": node.depth_min_m, "max_depth_m": node.depth_max_m})
+        return data
+    if node.kind == "virtual_imu":
+        return {
+            "mount_frame": node.sensor_mount_frame,
+            "rate_hz": node.sensor_rate_hz,
+            "accel_noise": node.imu_accel_noise,
+            "gyro_noise": node.imu_gyro_noise,
+            "include_magnetometer": node.imu_include_magnetometer,
+        }
+    if node.kind == "virtual_tactile_array":
+        return {
+            "geom": node.tactile_geom,
+            "mesh": node.tactile_mesh,
+            "rate_hz": node.sensor_rate_hz,
+            "contact_threshold": node.tactile_threshold,
+        }
     return {}
 
 
@@ -210,46 +357,76 @@ def _flow_dof(context: bpy.types.Context) -> int:
     return len(_joint_controls(root)) or int(root.get("joint_count", 6)) or 6
 
 
-def _set_application_ports(
+def _set_data_ports(
     node: CaryamBehaviorNode,
-    inputs: tuple[tuple[str, tuple[int, ...]], ...],
-    outputs: tuple[tuple[str, tuple[int, ...]], ...],
+    kind: str,
+    inputs: tuple[PortSpec, ...],
+    outputs: tuple[PortSpec, ...],
 ) -> None:
-    node.kind = "application"
+    node.kind = kind
     node.input_ports.clear()
     node.output_ports.clear()
-    for name, shape in inputs:
+    for spec in inputs:
         port = node.input_ports.add()
-        port.port_name = name
-        port.shape_csv = ",".join(str(value) for value in shape)
-    for name, shape in outputs:
+        port.port_name = spec.name
+        port.shape_csv = ",".join(str(value) for value in spec.shape)
+        port.data_type = spec.data_type
+        port.delivery = spec.delivery
+    for spec in outputs:
         port = node.output_ports.add()
-        port.port_name = name
-        port.shape_csv = ",".join(str(value) for value in shape)
+        port.port_name = spec.name
+        port.shape_csv = ",".join(str(value) for value in spec.shape)
+        port.data_type = spec.data_type
+        port.delivery = spec.delivery
     node.sync_sockets()
 
 
 def _configure_flow_preset(node: CaryamBehaviorNode, preset: str, dof: int) -> None:
     presets = {
-        "application": ("Application", (), (("output", ()),), (0.20, 0.32, 0.55)),
-        "virtual_camera": ("Virtual RGB Camera", (), (("rgb", (1, 3, 480, 640)),), (0.12, 0.36, 0.52)),
-        "virtual_depth_camera": ("Virtual Depth Camera", (), (("depth", (1, 1, 480, 640)),), (0.12, 0.36, 0.52)),
-        "virtual_lidar": ("Virtual Lidar", (), (("ranges", (1, 360)),), (0.12, 0.36, 0.52)),
+        "application": ("Application", "application", (), (PortSpec("output"),), (0.20, 0.32, 0.55)),
+        "virtual_camera": ("RGB Camera", "virtual_rgb_camera", (), (PortSpec("rgb_image", (1, 3, 480, 640), "image_rgb8"),), (0.12, 0.36, 0.52)),
+        "virtual_rgb_camera": ("RGB Camera", "virtual_rgb_camera", (), (PortSpec("rgb_image", (1, 3, 480, 640), "image_rgb8"),), (0.12, 0.36, 0.52)),
+        "virtual_depth_camera": ("Depth Camera", "virtual_depth_camera", (), (PortSpec("depth_image", (1, 1, 480, 640), "image_depth32f"),), (0.10, 0.42, 0.50)),
+        "virtual_imu": ("IMU", "virtual_imu", (), (PortSpec("imu", data_type="imu"),), (0.16, 0.45, 0.30)),
+        "virtual_tactile_array": ("Tactile Array", "virtual_tactile_array", (), (PortSpec("tactile_array", data_type="tactile_array"),), (0.48, 0.30, 0.12)),
+        "virtual_lidar": (
+            "Virtual Lidar",
+            "virtual_lidar",
+            (),
+            (PortSpec("point_cloud", data_type="point_cloud2"),),
+            (0.12, 0.36, 0.52),
+        ),
         "ai_model": (
             "AI Model",
-            (("rgb", (1, 3, 480, 640)),),
-            (("joint_positions", (1, dof)),),
+            "application",
+            (PortSpec("rgb", (1, 3, 480, 640), "image"),),
+            (PortSpec("joint_positions", (1, dof), "joint_positions"),),
             (0.44, 0.25, 0.12),
         ),
         "actuator_system": (
             f"{dof}-Actuator System",
-            (("joint_positions", (1, dof)),),
+            "application",
+            (PortSpec("joint_positions", (1, dof), "joint_positions"),),
             (),
             (0.38, 0.14, 0.12),
         ),
+        "joint_controller": (
+            "Joint Controller",
+            "joint_controller",
+            (PortSpec("target", data_type="joint_positions"),),
+            (PortSpec("joint_target", data_type="joint_target", delivery="command"),),
+            (0.38, 0.14, 0.12),
+        ),
+        "joint_target": (
+            "Joint Target",
+            "joint_target",
+            (PortSpec("joint_target", data_type="joint_target", delivery="command"),),
+            (PortSpec("joint_target", data_type="joint_target", delivery="command"),),
+            (0.50, 0.16, 0.10),
+        ),
     }
-    label, inputs, outputs, color = presets[preset]
-    _set_application_ports(node, inputs, outputs)
+    label, kind, inputs, outputs, color = presets[preset]
+    _set_data_ports(node, kind, inputs, outputs)
     node.label = label
     node.use_custom_color = True
     node.color = color
@@ -264,9 +441,9 @@ def _graph_from_tree(tree: CaryamBehaviorTree) -> BehaviorGraph:
         inputs = ()
         outputs = ()
         handler = ""
-        if node.kind == "application":
-            inputs = tuple(PortSpec(port.port_name, port.shape_tuple()) for port in node.input_ports if port.port_name)
-            outputs = tuple(PortSpec(port.port_name, port.shape_tuple()) for port in node.output_ports if port.port_name)
+        if node.kind in TYPED_DATA_NODE_KINDS:
+            inputs = tuple(port.to_spec() for port in node.input_ports if port.port_name)
+            outputs = tuple(port.to_spec() for port in node.output_ports if port.port_name)
             handler = node.handler
         nodes.append(
             BehaviorNode(
@@ -284,8 +461,8 @@ def _graph_from_tree(tree: CaryamBehaviorTree) -> BehaviorGraph:
     for link in tree.links:
         if not isinstance(link.from_node, CaryamBehaviorNode) or not isinstance(link.to_node, CaryamBehaviorNode):
             continue
-        source_port = link.from_socket.name if link.from_node.kind == "application" else "value"
-        target_port = link.to_socket.name if link.to_node.kind == "application" else "value"
+        source_port = link.from_socket.name if link.from_node.kind in TYPED_DATA_NODE_KINDS else "value"
+        target_port = link.to_socket.name if link.to_node.kind in TYPED_DATA_NODE_KINDS else "value"
         links.append(BehaviorLink(link.from_node.node_id, link.to_node.node_id, source_port, target_port))
     return BehaviorGraph(tree.name, nodes, links)
 
@@ -296,7 +473,7 @@ def _populate_behavior_tree(tree: CaryamBehaviorTree, graph: BehaviorGraph) -> N
     for item in graph.nodes:
         node = tree.nodes.new("CARYAM_BEHAVIOR_NODE")
         node.node_id = item.node_id
-        node.kind = item.kind if item.kind in {"start", "sensor", "ai_model", "condition", "action", "application", "end"} else "sensor"
+        node.kind = item.kind if item.kind in {"start", "stop", "wait", "retry", "success", "failure", "sensor", "ai_model", "joint_controller", "joint_target", "condition", "action", "end", "application", "virtual_lidar", "virtual_rgb_camera", "virtual_depth_camera", "virtual_imu", "virtual_tactile_array"} else "sensor"
         node.label = item.label
         node.location = item.position
         node.handler = item.handler
@@ -306,25 +483,44 @@ def _populate_behavior_tree(tree: CaryamBehaviorTree, graph: BehaviorGraph) -> N
         node.robot_id = str(data.get("robot_id", ""))
         node.joint_name = str(data.get("joint", ""))
         node.target = float(data.get("target", 0.0))
-        if node.kind == "application":
+        node.lidar_max_range_m = float(data.get("max_range_m", 10.0))
+        node.lidar_samples = int(data.get("horizontal_samples", 360))
+        node.sensor_mount_frame = str(data.get("mount_frame", ""))
+        node.sensor_rate_hz = float(data.get("rate_hz", 30.0))
+        node.camera_width = int(data.get("width", 640))
+        node.camera_height = int(data.get("height", 480))
+        node.camera_fov_degrees = float(data.get("vertical_fov_degrees", 60.0))
+        node.depth_min_m = float(data.get("min_depth_m", 0.1))
+        node.depth_max_m = float(data.get("max_depth_m", 10.0))
+        node.imu_accel_noise = float(data.get("accel_noise", 0.0))
+        node.imu_gyro_noise = float(data.get("gyro_noise", 0.0))
+        node.imu_include_magnetometer = bool(data.get("include_magnetometer", False))
+        node.tactile_geom = str(data.get("geom", ""))
+        node.tactile_mesh = str(data.get("mesh", ""))
+        node.tactile_threshold = float(data.get("contact_threshold", 0.0))
+        if node.kind in TYPED_DATA_NODE_KINDS:
             node.input_ports.clear()
             for port in item.inputs:
                 entry = node.input_ports.add()
                 entry.port_name = port.name
                 entry.shape_csv = ",".join(str(value) for value in port.shape)
+                entry.data_type = port.data_type
+                entry.delivery = port.delivery
             node.output_ports.clear()
             for port in item.outputs:
                 entry = node.output_ports.add()
                 entry.port_name = port.name
                 entry.shape_csv = ",".join(str(value) for value in port.shape)
+                entry.data_type = port.data_type
+                entry.delivery = port.delivery
         node.sync_sockets()
         node_map[item.node_id] = node
     for link in graph.links:
         source = node_map.get(link.source)
         target = node_map.get(link.target)
         if source is not None and target is not None:
-            source_socket = source.outputs.get(link.source_port) if source.kind == "application" else source.outputs[0]
-            target_socket = target.inputs.get(link.target_port) if target.kind == "application" else target.inputs[0]
+            source_socket = source.outputs.get(link.source_port) if source.kind in TYPED_DATA_NODE_KINDS else source.outputs[0]
+            target_socket = target.inputs.get(link.target_port) if target.kind in TYPED_DATA_NODE_KINDS else target.inputs[0]
             if source_socket is not None and target_socket is not None:
                 tree.links.new(source_socket, target_socket)
 
@@ -332,7 +528,7 @@ def _populate_behavior_tree(tree: CaryamBehaviorTree, graph: BehaviorGraph) -> N
 def _ensure_behavior_tree(scene: bpy.types.Scene) -> CaryamBehaviorTree:
     tree = scene.robot_behavior_tree
     if tree is None:
-        tree = bpy.data.node_groups.new("Robot Behavior", "CARYAM_BEHAVIOR_TREE")
+        tree = bpy.data.node_groups.new("Caryam Data Graph", "CARYAM_BEHAVIOR_TREE")
         scene.robot_behavior_tree = tree
     return tree
 
@@ -1110,9 +1306,107 @@ class ROBOT_OT_launch_mujoco(Operator):
         return {"FINISHED"}
 
 
+def _core_bridge_request(
+    bridge_url: str,
+    method: str,
+    path: str,
+    payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        f"{bridge_url.rstrip('/')}{path}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+    )
+    with urllib.request.urlopen(request, timeout=2.0) as response:
+        value = json.loads(response.read().decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("Core bridge returned an invalid response")
+    if "error" in value:
+        raise RuntimeError(str(value["error"]))
+    return value
+
+
+def _update_core_status(scene: bpy.types.Scene, status: Mapping[str, Any]) -> None:
+    endpoint = str(status.get("core_endpoint", f"{scene.robot_core_host}:{scene.robot_core_port}"))
+    state = str(status.get("state", "unknown"))
+    scene.robot_core_status = f"{state.title()} at {endpoint}"
+    blackboard = status.get("blackboard", {})
+    scene.robot_core_command_valid = bool(blackboard.get("caryam.control.command_valid", False)) if isinstance(blackboard, dict) else False
+    logs = status.get("logs", [])
+    scene.robot_core_log = "\n".join(str(entry) for entry in logs[-5:]) if isinstance(logs, list) else ""
+
+
+class ROBOT_OT_core_status(Operator):
+    bl_idname = "robot_library.core_status"
+    bl_label = "Refresh Core Status"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        scene = context.scene
+        try:
+            _update_core_status(scene, _core_bridge_request(scene.robot_core_bridge_url, "GET", "/status"))
+        except (OSError, RuntimeError, ValueError, urllib.error.URLError) as error:
+            scene.robot_core_status = f"Bridge unavailable: {error}"
+            scene.robot_core_command_valid = False
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class ROBOT_OT_run_core_simulation(Operator):
+    bl_idname = "robot_library.run_core_simulation"
+    bl_label = "Run in Core Simulation"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        scene = context.scene
+        graph = _graph_from_tree(_ensure_behavior_tree(scene))
+        errors = graph.validate()
+        if errors:
+            self.report({"ERROR"}, "; ".join(errors))
+            return {"CANCELLED"}
+        try:
+            status = _core_bridge_request(
+                scene.robot_core_bridge_url,
+                "POST",
+                "/run",
+                {
+                    "graph": graph.to_dict(),
+                    "core_host": scene.robot_core_host,
+                    "core_port": scene.robot_core_port,
+                },
+            )
+            _update_core_status(scene, status)
+        except (OSError, RuntimeError, ValueError, urllib.error.URLError) as error:
+            scene.robot_core_status = f"Bridge unavailable: {error}"
+            scene.robot_core_command_valid = False
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Core simulation flow started")
+        return {"FINISHED"}
+
+
+class ROBOT_OT_stop_core_simulation(Operator):
+    bl_idname = "robot_library.stop_core_simulation"
+    bl_label = "Stop Core Simulation"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        scene = context.scene
+        try:
+            _update_core_status(scene, _core_bridge_request(scene.robot_core_bridge_url, "POST", "/stop", {}))
+        except (OSError, RuntimeError, ValueError, urllib.error.URLError) as error:
+            scene.robot_core_status = f"Bridge unavailable: {error}"
+            scene.robot_core_command_valid = False
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 class ROBOT_OT_open_behavior_editor(Operator):
     bl_idname = "robot_library.open_behavior_editor"
-    bl_label = "Open Behavior Editor"
+    bl_label = "Open Data Graph"
     bl_options = {"REGISTER"}
 
     def execute(self, context: bpy.types.Context) -> set[str]:
@@ -1128,7 +1422,7 @@ class ROBOT_OT_open_behavior_editor(Operator):
 
 class ROBOT_OT_new_behavior(Operator):
     bl_idname = "robot_library.new_behavior"
-    bl_label = "Clear Behavior Canvas"
+    bl_label = "Clear Data Graph"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context: bpy.types.Context) -> set[str]:
@@ -1140,15 +1434,22 @@ class ROBOT_OT_new_behavior(Operator):
 
 class ROBOT_OT_add_behavior_node(Operator):
     bl_idname = "robot_library.add_behavior_node"
-    bl_label = "Add Behavior Node"
+    bl_label = "Add Data Node"
     bl_options = {"REGISTER", "UNDO"}
 
     kind: EnumProperty(
         name="Kind",
         items=(
             ("start", "Start", "Begin a graph"),
+            ("stop", "Stop", "Stop the current data flow"),
+            ("wait", "Wait", "Wait for the next data-flow tick"),
+            ("retry", "Retry", "Retry on a later data-flow tick"),
+            ("success", "Success", "Mark the current control branch successful"),
+            ("failure", "Failure", "Mark the current control branch failed"),
             ("sensor", "Virtual Sensor", ""),
             ("ai_model", "AI Model", ""),
+            ("joint_controller", "Joint Controller", ""),
+            ("joint_target", "Joint Target", ""),
             ("condition", "Condition", ""),
             ("action", "Robot Action", ""),
             ("application", "Application", ""),
@@ -1159,10 +1460,13 @@ class ROBOT_OT_add_behavior_node(Operator):
     preset: EnumProperty(
         name="Preset",
         items=(
-            ("legacy", "Legacy", "Use the selected behavior kind"),
+            ("legacy", "Legacy", "Use the selected data node kind"),
             ("application", "Application", "A custom application node with editable ports"),
             ("virtual_camera", "Virtual RGB Camera", "A 480p RGB virtual sensor"),
+            ("virtual_rgb_camera", "RGB Camera", "A 480p RGB virtual sensor"),
             ("virtual_depth_camera", "Virtual Depth Camera", "A 480p depth virtual sensor"),
+            ("virtual_imu", "IMU", "An accelerometer and gyroscope sensor"),
+            ("virtual_tactile_array", "Tactile Array", "A tactile mesh sensor"),
             ("virtual_lidar", "Virtual Lidar", "A 360-sample virtual sensor"),
             ("ai_model", "AI Model", "Consumes RGB and emits robot joint positions"),
             ("actuator_system", "N-Actuator System", "Consumes joint positions for the selected robot DOF"),
@@ -1195,11 +1499,19 @@ def _draw_behavior_add_menu(menu: bpy.types.Menu, context: bpy.types.Context) ->
     layout.label(text="Caryam Flow")
     for preset, label, icon in (
         ("application", "Application", "SCRIPT"),
-        ("virtual_camera", "Virtual RGB Camera", "OUTLINER_OB_CAMERA"),
-        ("virtual_depth_camera", "Virtual Depth Camera", "CAMERA_DATA"),
+        ("virtual_rgb_camera", "RGB Camera", "OUTLINER_OB_CAMERA"),
+        ("virtual_depth_camera", "Depth Camera", "CAMERA_DATA"),
         ("virtual_lidar", "Virtual Lidar", "FORCE_TURBULENCE"),
+        ("virtual_imu", "IMU", "EMPTY_ARROWS"),
+        ("virtual_tactile_array", "Tactile Array", "MOD_SOFT"),
         ("ai_model", "AI Model", "LIGHT_DATA"),
         ("actuator_system", "N-Actuator System", "CONSTRAINT_BONE"),
+        ("start", "Start", "PLAY"),
+        ("stop", "Stop", "PAUSE"),
+        ("wait", "Wait", "TIME"),
+        ("retry", "Retry", "FILE_REFRESH"),
+        ("success", "Success", "CHECKMARK"),
+        ("failure", "Failure", "CANCEL"),
     ):
         operator = layout.operator("robot_library.add_behavior_node", text=label, icon=icon)
         operator.preset = preset
@@ -1217,7 +1529,7 @@ class ROBOT_OT_add_port(Operator):
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         node = context.active_node
-        if not isinstance(node, CaryamBehaviorNode) or node.kind != "application":
+        if not isinstance(node, CaryamBehaviorNode) or node.kind not in PORT_CONFIGURABLE_NODE_KINDS:
             self.report({"WARNING"}, "Select an Application node first")
             return {"CANCELLED"}
         ports = node.input_ports if self.direction == "input" else node.output_ports
@@ -1240,7 +1552,7 @@ class ROBOT_OT_remove_port(Operator):
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         node = context.active_node
-        if not isinstance(node, CaryamBehaviorNode) or node.kind != "application":
+        if not isinstance(node, CaryamBehaviorNode) or node.kind not in PORT_CONFIGURABLE_NODE_KINDS:
             return {"CANCELLED"}
         ports = node.input_ports if self.direction == "input" else node.output_ports
         if 0 <= self.port_index < len(ports):
@@ -1249,9 +1561,29 @@ class ROBOT_OT_remove_port(Operator):
         return {"FINISHED"}
 
 
+class ROBOT_OT_delete_data_node(Operator):
+    bl_idname = "robot_library.delete_data_node"
+    bl_label = "Delete Data Node"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(options={"HIDDEN"})
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        tree = _behavior_tree(context) or _ensure_behavior_tree(context.scene)
+        node = tree.nodes.get(self.node_name)
+        if node is None:
+            self.report({"WARNING"}, "Data node no longer exists")
+            return {"CANCELLED"}
+        tree.nodes.remove(node)
+        return {"FINISHED"}
+
+
 class ROBOT_OT_save_behavior(Operator, ExportHelper):
     bl_idname = "robot_library.save_behavior"
-    bl_label = "Save Behavior Graph"
+    bl_label = "Save Data Graph"
     bl_options = {"REGISTER"}
 
     filename_ext = ".json"
@@ -1271,7 +1603,7 @@ class ROBOT_OT_save_behavior(Operator, ExportHelper):
 
 class ROBOT_OT_load_behavior(Operator, ImportHelper):
     bl_idname = "robot_library.load_behavior"
-    bl_label = "Load Behavior Graph"
+    bl_label = "Load Data Graph"
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".json"
@@ -1290,7 +1622,7 @@ class ROBOT_OT_load_behavior(Operator, ImportHelper):
 
 class ROBOT_OT_run_behavior(Operator):
     bl_idname = "robot_library.run_behavior"
-    bl_label = "Run Behavior Graph"
+    bl_label = "Run Data Graph"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context: bpy.types.Context) -> set[str]:
@@ -1300,7 +1632,7 @@ class ROBOT_OT_run_behavior(Operator):
         except (ValueError, KeyError, TypeError) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        self.report({"INFO"}, "Behavior graph executed")
+        self.report({"INFO"}, "Data graph executed")
         return {"FINISHED"}
 
 
@@ -1465,6 +1797,35 @@ class ROBOT_PT_mujoco_world(Panel):
         row.operator("robot_library.launch_mujoco", text="Play", icon="PLAY")
 
 
+class ROBOT_PT_core_simulation(Panel):
+    bl_label = "Intrinsic Core"
+    bl_idname = "ROBOT_PT_core_simulation"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Sim"
+    bl_parent_id = "ROBOT_PT_simulation"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        scene = context.scene
+        layout.prop(scene, "robot_core_bridge_url", text="Bridge")
+        endpoint_row = layout.row(align=True)
+        endpoint_row.prop(scene, "robot_core_host", text="Host")
+        endpoint_row.prop(scene, "robot_core_port", text="Port")
+        controls = layout.row(align=True)
+        controls.operator("robot_library.core_status", text="", icon="FILE_REFRESH")
+        controls.operator("robot_library.run_core_simulation", text="Run", icon="PLAY")
+        controls.operator("robot_library.stop_core_simulation", text="", icon="PAUSE")
+        layout.label(text=scene.robot_core_status, icon="INFO")
+        command_row = layout.row()
+        command_row.enabled = False
+        command_row.prop(scene, "robot_core_command_valid", text="Command Valid")
+        if scene.robot_core_log:
+            log_box = layout.box()
+            for line in scene.robot_core_log.splitlines():
+                log_box.label(text=line, icon="CONSOLE")
+
+
 class ROBOT_PT_gazebo_world(Panel):
     bl_label = "Gazebo"
     bl_idname = "ROBOT_PT_gazebo_world"
@@ -1489,14 +1850,14 @@ class ROBOT_PT_simulation(Panel):
 
 
 class ROBOT_PT_behavior_graph(Panel):
-    bl_label = "Robot Flow"
+    bl_label = "Robot Data Graph"
     bl_idname = "ROBOT_PT_behavior_graph"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Robot Control"
 
     def draw(self, context: bpy.types.Context) -> None:
-        self.layout.operator("robot_library.open_behavior_editor", text="Open Behavior Editor", icon="NODETREE")
+        self.layout.operator("robot_library.open_behavior_editor", text="Open Data Graph", icon="NODETREE")
 
 
 class ROBOT_PT_rcs_control(Panel):
@@ -1511,11 +1872,11 @@ class ROBOT_PT_rcs_control(Panel):
 
 
 class ROBOT_PT_behavior_editor(Panel):
-    bl_label = "Caryam Flow"
+    bl_label = "Caryam Data Graph"
     bl_idname = "ROBOT_PT_behavior_editor"
     bl_space_type = "NODE_EDITOR"
     bl_region_type = "UI"
-    bl_category = "Robot Flow"
+    bl_category = "Data Graph"
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -1529,13 +1890,28 @@ class ROBOT_PT_behavior_editor(Panel):
         layout.label(text="Add Flow Node")
         for preset, label, icon in (
             ("application", "Application", "SCRIPT"),
-            ("virtual_camera", "Virtual RGB Camera", "OUTLINER_OB_CAMERA"),
+            ("virtual_rgb_camera", "RGB Camera", "OUTLINER_OB_CAMERA"),
+            ("virtual_depth_camera", "Depth Camera", "CAMERA_DATA"),
             ("virtual_lidar", "Virtual Lidar", "FORCE_TURBULENCE"),
+            ("virtual_imu", "IMU", "EMPTY_ARROWS"),
+            ("virtual_tactile_array", "Tactile Array", "MOD_SOFT"),
             ("ai_model", "AI Model", "LIGHT_DATA"),
             ("actuator_system", "N-Actuator System", "CONSTRAINT_BONE"),
         ):
             operator = layout.operator("robot_library.add_behavior_node", text=label, icon=icon)
             operator.preset = preset
+        layout.separator()
+        layout.label(text="Add Control Node")
+        for kind, label, icon in (
+            ("start", "Start", "PLAY"),
+            ("stop", "Stop", "PAUSE"),
+            ("wait", "Wait", "TIME"),
+            ("retry", "Retry", "FILE_REFRESH"),
+            ("success", "Success", "CHECKMARK"),
+            ("failure", "Failure", "CANCEL"),
+        ):
+            operator = layout.operator("robot_library.add_behavior_node", text=label, icon=icon)
+            operator.kind = kind
         layout.separator()
         file_row = layout.row(align=True)
         file_row.operator("robot_library.load_behavior", text="Load", icon="IMPORT")
@@ -1557,11 +1933,15 @@ CLASSES = (
     ROBOT_OT_export_world,
     ROBOT_OT_export_and_render,
     ROBOT_OT_launch_mujoco,
+    ROBOT_OT_core_status,
+    ROBOT_OT_run_core_simulation,
+    ROBOT_OT_stop_core_simulation,
     ROBOT_OT_open_behavior_editor,
     ROBOT_OT_new_behavior,
     ROBOT_OT_add_behavior_node,
     ROBOT_OT_add_port,
     ROBOT_OT_remove_port,
+    ROBOT_OT_delete_data_node,
     ROBOT_OT_save_behavior,
     ROBOT_OT_load_behavior,
     ROBOT_OT_run_behavior,
@@ -1572,6 +1952,7 @@ CLASSES = (
     ROBOT_PT_joint_controls,
     ROBOT_PT_simulation,
     ROBOT_PT_mujoco_world,
+    ROBOT_PT_core_simulation,
     ROBOT_PT_gazebo_world,
     ROBOT_PT_behavior_graph,
     ROBOT_PT_rcs_control,
@@ -1580,7 +1961,24 @@ CLASSES = (
 
 
 def _remove_scene_properties() -> None:
-    for name in ("robot_library", "robot_library_index", "robot_library_status", "robot_library_filter", "robot_setup_path", "robot_library_auto_spread", "robot_library_include_collisions", "robot_library_control_root", "robot_mujoco_python", "robot_behavior_tree"):
+    for name in (
+        "robot_library",
+        "robot_library_index",
+        "robot_library_status",
+        "robot_library_filter",
+        "robot_setup_path",
+        "robot_library_auto_spread",
+        "robot_library_include_collisions",
+        "robot_library_control_root",
+        "robot_mujoco_python",
+        "robot_core_bridge_url",
+        "robot_core_host",
+        "robot_core_port",
+        "robot_core_status",
+        "robot_core_log",
+        "robot_core_command_valid",
+        "robot_behavior_tree",
+    ):
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
 
@@ -1612,7 +2010,13 @@ def register() -> None:
     bpy.types.Scene.robot_library_include_collisions = BoolProperty(name="Load Collision Geoms", default=False)
     bpy.types.Scene.robot_library_control_root = PointerProperty(name="Controlled Robot", type=bpy.types.Object)
     bpy.types.Scene.robot_mujoco_python = StringProperty(name="MuJoCo Python", default="python")
-    bpy.types.Scene.robot_behavior_tree = PointerProperty(name="Behavior Graph", type=CaryamBehaviorTree)
+    bpy.types.Scene.robot_core_bridge_url = StringProperty(name="Core Bridge", default="http://127.0.0.1:8765")
+    bpy.types.Scene.robot_core_host = StringProperty(name="Core Host", default="localhost")
+    bpy.types.Scene.robot_core_port = IntProperty(name="Core Port", default=17080, min=1, max=65535)
+    bpy.types.Scene.robot_core_status = StringProperty(name="Core Status", default="Bridge not checked")
+    bpy.types.Scene.robot_core_log = StringProperty(name="Core Log")
+    bpy.types.Scene.robot_core_command_valid = BoolProperty(name="Core Command Valid", default=False)
+    bpy.types.Scene.robot_behavior_tree = PointerProperty(name="Data Graph", type=CaryamBehaviorTree)
     bpy.types.NODE_MT_add.append(_draw_behavior_add_menu)
     bpy.app.timers.register(_refresh_active_library, first_interval=0.1)
 

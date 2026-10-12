@@ -1,4 +1,4 @@
-"""Validate the behavior graph and MuJoCo world export in Blender."""
+"""Validate the data graph and MuJoCo world export in Blender."""
 
 from __future__ import annotations
 
@@ -39,15 +39,14 @@ if not controls:
 tree = bpy.data.node_groups.new("Behavior Export Test", "CARYAM_BEHAVIOR_TREE")
 scene.robot_behavior_tree = tree
 blender_addon._populate_behavior_tree(tree, default_behavior_graph())
-action = next(node for node in tree.nodes if node.kind == "action")
-action.robot_id = root["robot_id"]
-action.joint_name = "shoulder_pan"
 graph = blender_addon._graph_from_tree(tree)
 assert graph.validate() == []
+assert [node.kind for node in graph.nodes] == ["sensor", "application", "joint_controller", "joint_target"]
 
 joint = blender_addon._joint_controls(root)[0]
 old_qpos = float(joint["qpos"])
-blender_addon._run_behavior_graph(graph)
+values = blender_addon._run_behavior_graph(graph)
+assert values["joint_target"] == {"target": old_qpos}
 assert abs(float(joint["qpos"]) - old_qpos) < 1e-12
 
 robot_collection = bpy.data.collections["Robot Library"]
@@ -81,5 +80,5 @@ with tempfile.TemporaryDirectory() as directory:
     assert world_path.with_suffix(".usd").is_file()
     assert "mujoco.viewer" in render_path.read_text(encoding="utf-8")
 
-print("Behavior graph and MuJoCo world export test passed")
+print("Data graph and MuJoCo world export test passed")
 robot_arm_library.unregister()

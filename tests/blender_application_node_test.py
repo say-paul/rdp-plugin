@@ -34,17 +34,75 @@ try:
         "start",
         "end",
     }
+    removable = canvas.nodes.new("CARYAM_BEHAVIOR_NODE")
+    removable.node_id = "remove_me"
+    result = bpy.ops.robot_library.delete_data_node(node_name=removable.name)
+    assert result == {"FINISHED"}, result
+    assert canvas.nodes.get(removable.name) is None
     result = bpy.ops.robot_library.new_behavior()
     assert result == {"FINISHED"}, result
     assert scene.robot_behavior_tree == canvas
     assert len(canvas.nodes) == 0
 
-    result = bpy.ops.robot_library.add_behavior_node(preset="virtual_camera")
+    result = bpy.ops.robot_library.add_behavior_node(preset="virtual_rgb_camera")
     assert result == {"FINISHED"}, result
     camera_preset = canvas.nodes[-1]
-    assert camera_preset.kind == "application"
-    assert camera_preset.output_ports[0].port_name == "rgb"
+    assert camera_preset.kind == "virtual_rgb_camera"
+    assert camera_preset.output_ports[0].port_name == "rgb_image"
     assert camera_preset.output_ports[0].shape_tuple() == (1, 3, 480, 640)
+    assert camera_preset.output_ports[0].data_type == "image_rgb8"
+    assert camera_preset.camera_output_label() == "Output: rgb_image [3X640X480] (RGB8)"
+    camera_preset.camera_width = 800
+    camera_preset.camera_height = 600
+    assert camera_preset.output_ports[0].shape_tuple() == (1, 3, 600, 800)
+    assert camera_preset.camera_output_label() == "Output: rgb_image [3X800X600] (RGB8)"
+
+    result = bpy.ops.robot_library.add_behavior_node(preset="virtual_depth_camera")
+    assert result == {"FINISHED"}, result
+    depth_preset = canvas.nodes[-1]
+    assert depth_preset.kind == "virtual_depth_camera"
+    assert [(port.port_name, port.data_type) for port in depth_preset.output_ports] == [
+        ("depth_image", "image_depth32f"),
+    ]
+    depth_preset.camera_width = 320
+    depth_preset.camera_height = 240
+    assert depth_preset.output_ports[0].shape_tuple() == (1, 1, 240, 320)
+    assert depth_preset.camera_output_label() == "Output: depth_image [1X320X240] (32FC1)"
+
+    result = bpy.ops.robot_library.add_behavior_node(preset="virtual_imu")
+    assert result == {"FINISHED"}, result
+    imu_preset = canvas.nodes[-1]
+    assert imu_preset.kind == "virtual_imu"
+    assert [(port.port_name, port.data_type) for port in imu_preset.output_ports] == [("imu", "imu")]
+
+    result = bpy.ops.robot_library.add_behavior_node(preset="virtual_tactile_array")
+    assert result == {"FINISHED"}, result
+    tactile_preset = canvas.nodes[-1]
+    assert tactile_preset.kind == "virtual_tactile_array"
+    assert [(port.port_name, port.data_type) for port in tactile_preset.output_ports] == [
+        ("tactile_array", "tactile_array"),
+    ]
+    camera_preset.sensor_mount_frame = "wrist_camera"
+    camera_preset.sensor_rate_hz = 15.0
+    depth_preset.depth_max_m = 4.0
+    imu_preset.imu_include_magnetometer = True
+    tactile_preset.tactile_geom = "finger_pad"
+    sensor_graph = blender_addon._graph_from_tree(canvas)
+    sensor_data = {node.node_id: node.data for node in sensor_graph.nodes}
+    assert sensor_data[camera_preset.node_id]["mount_frame"] == "wrist_camera"
+    assert sensor_data[depth_preset.node_id]["max_depth_m"] == 4.0
+    assert sensor_data[imu_preset.node_id]["include_magnetometer"] is True
+    assert sensor_data[tactile_preset.node_id]["geom"] == "finger_pad"
+
+    result = bpy.ops.robot_library.add_behavior_node(preset="virtual_lidar")
+    assert result == {"FINISHED"}, result
+    lidar_preset = canvas.nodes[-1]
+    assert lidar_preset.kind == "virtual_lidar"
+    assert [(port.port_name, port.data_type) for port in lidar_preset.output_ports] == [
+        ("point_cloud", "point_cloud2"),
+    ]
+    assert lidar_preset.lidar_max_range_m == 10.0
+    assert lidar_preset.lidar_samples == 360
 
     result = bpy.ops.robot_library.add_behavior_node(preset="ai_model")
     assert result == {"FINISHED"}, result

@@ -58,11 +58,21 @@ Free-base MJCF robots preserve their Blender root position and rotation, so sepa
 
 The **MuJoCo Python** field controls which Python executable launches the renderer. The composed world uses MuJoCo 3.2+'s model attachment API; the original MJCF and its assets remain external files, so keep their relative paths valid after export.
 
-## Behavior-driven flow editor
+## Data graph editor
 
-Use **Open Behavior Editor** to switch the current area to the **Caryam Flow** node editor. The starter graph contains **Start -> Virtual Sensor -> AI Model -> Robot Action -> End**. Add nodes from the sidebar, connect them in the node view, and save/load the graph as JSON.
+Use **Open Data Graph** to switch the current area to the **Caryam Data Graph** node editor. Add nodes from the sidebar, connect typed ports in the node view, and save/load the graph as JSON. Each port records its data type, tensor shape, delivery mode (`stream`, `state`, `event`, or `command`), timestamp requirement, and validity requirement.
 
-Virtual Sensor nodes can read `joint.qpos` or a Blender custom property using `object:ObjectName.property`. Robot Action nodes select an imported robot ID and joint name from the existing robot library metadata. The built-in `rule_based` AI node passes its input through as a deterministic test adapter; a later adapter can call an external model without changing the graph file format.
+Use the **Joint Controller** and **Joint Target** nodes to model a simulation command path. The controller rejects stale, invalid, and out-of-limit targets; the target node publishes the compact `joint_target` command proposal. A node's component type is fixed when it is added; edit only its own settings, never its behavior category. **RGB Camera** emits `rgb_image` in RGB8 format, **Depth Camera** emits `depth_image` in 32FC1 format, **IMU** emits `imu`, and **Tactile Array** emits `tactile_array`; their sensor settings are serialized with the graph. The tactile array must reference a configured MuJoCo tactile geom and mesh. **Virtual Lidar** always emits a `point_cloud` port in `ROS PointCloud2` format, with editable maximum range and horizontal-sample settings. Virtual Sensor nodes can read `joint.qpos` or a Blender custom property using `object:ObjectName.property`.
+
+## Intrinsic Core simulation
+
+Start the external bridge in the Core simulation environment, not inside Blender:
+
+```bash
+python -m robot_arm_library.core_bridge --host 127.0.0.1 --port 8765
+```
+
+In Blender, open **Sim > Intrinsic Core**, set the bridge URL and Core endpoint (default `localhost:17080`), then select **Run**. The bridge runs the data graph in simulation mode and exposes status, compact blackboard outputs, and recent logs over local JSON HTTP. It publishes only `caryam.perception.part_pose`, `caryam.imu.tilt_exceeded`, `caryam.control.joint_target`, and `caryam.control.command_valid`; raw sensor frames remain in the flow transport. The current MVP never sends a physical robot command.
 
 ## Joint controls and animation
 
