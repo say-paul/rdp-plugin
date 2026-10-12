@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Blender add-on for discovering and placing Robot Library"
 requires-python = ">=3.10"
 
+[project.scripts]
+caryam-core-bridge = "robot_arm_library.core_bridge:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
