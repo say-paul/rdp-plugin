@@ -70,6 +70,26 @@ def _mesh_data(
     return mesh
 
 
+def _proxy_box_data(model, geom_id: int) -> bpy.types.Mesh:
+    """Build a small viewport stand-in from MuJoCo's compiled geom bounds."""
+    bounds = model.geom_aabb[geom_id]
+    center = tuple(float(value) for value in bounds[:3])
+    half_size = tuple(max(0.0005, float(value)) for value in bounds[3:])
+    vertices = [
+        (center[0] + x * half_size[0], center[1] + y * half_size[1], center[2] + z * half_size[2])
+        for x, y, z in (
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
+        )
+    ]
+    faces = ((0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
+             (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7))
+    mesh = bpy.data.meshes.new(name=f"MuJoCo Proxy {geom_id}")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    return mesh
+
+
 def _primitive_object(model, geom_id: int, name: str) -> bpy.types.Object | None:
     geom_type = int(model.geom_type[geom_id])
     size = tuple(float(value) for value in model.geom_size[geom_id])
@@ -162,7 +182,10 @@ def import_compiled_mjcf(
     collection: bpy.types.Collection,
     include_collisions: bool = False,
     mesh_detail: float = 1.0,
+    preview_mode: str = "DETAILED",
 ) -> list[bpy.types.Object]:
+    if preview_mode not in {"PROXY", "DETAILED"}:
+        raise ValueError(f"Unknown robot preview mode: {preview_mode}")
     mesh_detail = max(0.01, min(1.0, mesh_detail))
     mujoco = _load_mujoco()
     model = mujoco.MjModel.from_xml_path(str(path))
@@ -244,6 +267,14 @@ def import_compiled_mjcf(
     mesh_cache: dict[int, bpy.types.Mesh] = {}
     material_cache: dict[tuple[float, ...], bpy.types.Material] = {}
     collision_count = 0
+    proxy_geom_types = {
+        int(mujoco.mjtGeom.mjGEOM_SPHERE),
+        int(mujoco.mjtGeom.mjGEOM_CAPSULE),
+        int(mujoco.mjtGeom.mjGEOM_ELLIPSOID),
+        int(mujoco.mjtGeom.mjGEOM_CYLINDER),
+        int(mujoco.mjtGeom.mjGEOM_BOX),
+        int(mujoco.mjtGeom.mjGEOM_MESH),
+    }
     for geom_id in range(model.ngeom):
         geom_group = int(model.geom_group[geom_id])
         is_collision = geom_group in {3, 4}
@@ -251,7 +282,17 @@ def import_compiled_mjcf(
             continue
         geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or f"geom_{geom_id}"
         geom_type = int(model.geom_type[geom_id])
-        if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
+        if preview_mode == "PROXY":
+            if geom_type not in proxy_geom_types:
+                continue
+            mesh_id = int(model.geom_dataid[geom_id]) if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH) else -1
+            if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH) and mesh_id < 0:
+                continue
+            obj = bpy.data.objects.new(f"Geom: {geom_name}", _proxy_box_data(model, geom_id))
+            collection.objects.link(obj)
+            obj[SOURCE_TRIANGLE_COUNT_PROPERTY] = int(model.mesh_facenum[mesh_id]) if mesh_id >= 0 else 12
+            obj.show_wire = True
+        elif geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
             mesh_id = int(model.geom_dataid[geom_id])
             if mesh_id < 0:
                 continue
@@ -271,7 +312,7 @@ def import_compiled_mjcf(
         body_id = int(model.geom_bodyid[geom_id])
         obj.parent = body_objects.get(body_id, root)
         obj.matrix_world = root.matrix_world @ _pose_matrix(data.geom_xpos[geom_id], data.geom_xmat[geom_id])
-        if geom_type != int(mujoco.mjtGeom.mjGEOM_MESH):
+        if preview_mode == "DETAILED" and geom_type != int(mujoco.mjtGeom.mjGEOM_MESH):
             obj.scale = primitive_scale
         obj["mujoco_geom_id"] = geom_id
         obj["is_collision"] = is_collision
@@ -287,11 +328,18 @@ def import_compiled_mjcf(
     root["body_count"] = model.nbody - 1
     root["joint_count"] = model.njnt
     root["collision_count"] = collision_count
+    root["preview_mode"] = preview_mode
     root["mesh_detail"] = mesh_detail
-    root["source_triangle_count"] = sum(
-        int(obj.data.get(SOURCE_TRIANGLE_COUNT_PROPERTY, mesh_triangle_count(obj.data)))
-        for obj in imported
-        if obj.type == "MESH"
-    )
-    root["triangle_count"] = sum(mesh_triangle_count(obj.data) for obj in imported if obj.type == "MESH")
+    source_triangle_count = 0
+    triangle_count = 0
+    for obj in imported:
+        if obj.type != "MESH":
+            continue
+        current_count = mesh_triangle_count(obj.data)
+        triangle_count += current_count
+        source_triangle_count += int(
+            obj.get(SOURCE_TRIANGLE_COUNT_PROPERTY, obj.data.get(SOURCE_TRIANGLE_COUNT_PROPERTY, current_count))
+        )
+    root["source_triangle_count"] = source_triangle_count
+    root["triangle_count"] = triangle_count
     return imported

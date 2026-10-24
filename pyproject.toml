@@ -9,6 +9,8 @@ caryam-core-bridge = "robot_arm_library.core_bridge:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
 
 [project.optional-dependencies]
 mujoco = ["mujoco>=3.2"]

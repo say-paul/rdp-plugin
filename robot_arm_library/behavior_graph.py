@@ -51,10 +51,22 @@ class PortSpec:
     delivery: str = "stream"
     requires_timestamp: bool = True
     requires_validity: bool = True
+    dtype: str = ""
+    semantic: str = ""
+    unit: str = ""
+    rate_hz: float | None = None
+    variable: bool = False
 
     def compatibility_error(self, target: "PortSpec") -> str | None:
         if self.data_type != "any" and target.data_type != "any" and self.data_type != target.data_type:
             return f"Incompatible port types: {self.data_type} -> {target.data_type}"
+        for field_name in ("dtype", "semantic", "unit"):
+            source_value = getattr(self, field_name)
+            target_value = getattr(target, field_name)
+            if source_value and target_value and source_value != target_value:
+                return f"Incompatible port {field_name}: {source_value} -> {target_value}"
+        if self.variable and not target.variable:
+            return "Variable-length output requires a variable-length input"
         if self.shape and target.shape and self.shape != target.shape:
             return f"Incompatible port shapes: {self.shape} -> {target.shape}"
         if self.delivery not in DELIVERY_MODES:
@@ -70,7 +82,7 @@ class PortSpec:
         return None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "name": self.name,
             "shape": list(self.shape),
             "type": self.data_type,
@@ -78,6 +90,15 @@ class PortSpec:
             "requires_timestamp": self.requires_timestamp,
             "requires_validity": self.requires_validity,
         }
+        for field_name in ("dtype", "semantic", "unit"):
+            field_value = getattr(self, field_name)
+            if field_value:
+                value[field_name] = field_value
+        if self.rate_hz is not None:
+            value["rate_hz"] = self.rate_hz
+        if self.variable:
+            value["variable"] = True
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "PortSpec":
@@ -90,6 +111,11 @@ class PortSpec:
             delivery=str(value.get("delivery", "stream")),
             requires_timestamp=bool(value.get("requires_timestamp", True)),
             requires_validity=bool(value.get("requires_validity", True)),
+            dtype=str(value.get("dtype", "")),
+            semantic=str(value.get("semantic", "")),
+            unit=str(value.get("unit", "")),
+            rate_hz=float(value["rate_hz"]) if value.get("rate_hz") is not None else None,
+            variable=bool(value.get("variable", False)),
         )
 
 
@@ -201,13 +227,13 @@ class BehaviorGraph:
             target_node = node_map.get(link.target)
             if (
                 source_node is not None
-                and source_node.outputs
+                and (source_node.outputs or source_node.kind in PORT_REQUIRED_NODE_KINDS)
                 and link.source_port not in source_node.output_names()
             ):
                 errors.append(f"Unknown output port '{link.source_port}' on {link.source}")
             if (
                 target_node is not None
-                and target_node.inputs
+                and (target_node.inputs or target_node.kind in PORT_REQUIRED_NODE_KINDS)
                 and link.target_port not in target_node.input_names()
             ):
                 errors.append(f"Unknown input port '{link.target_port}' on {link.target}")
@@ -221,11 +247,17 @@ class BehaviorGraph:
                 if source_port is not None and target_port is not None:
                     compatibility_error = source_port.compatibility_error(target_port)
                     if compatibility_error is not None:
-                        errors.append(
-                            "Incompatible port shapes: "
-                            f"{link.source}.{link.source_port} {source_port.shape} -> "
-                            f"{link.target}.{link.target_port} {target_port.shape}"
-                        )
+                        if compatibility_error.startswith("Incompatible port shapes:"):
+                            errors.append(
+                                "Incompatible port shapes: "
+                                f"{link.source}.{link.source_port} {source_port.shape} -> "
+                                f"{link.target}.{link.target_port} {target_port.shape}"
+                            )
+                        else:
+                            errors.append(
+                                f"{link.source}.{link.source_port} -> "
+                                f"{link.target}.{link.target_port}: {compatibility_error}"
+                            )
             if link.source not in known_ids:
                 errors.append(f"Unknown link source: {link.source}")
             if link.target not in known_ids:

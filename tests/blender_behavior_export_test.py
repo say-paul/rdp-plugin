@@ -58,6 +58,8 @@ scene_collection.objects.link(root)
 bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8, location=(0.0, 2.5, 1.8))
 ball = bpy.context.active_object
 ball.name = "Plastic Ball"
+bpy.ops.rigidbody.object_add()
+ball.rigid_body.collision_shape = "SPHERE"
 bpy.ops.mesh.primitive_cube_add(location=(1.0, 0.0, 0.5))
 static_block = bpy.context.active_object
 static_block.name = "Static Block"

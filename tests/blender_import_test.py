@@ -21,6 +21,7 @@ robot_arm_library.register()
 scene = bpy.context.scene
 menagerie_path = Path.home() / "git_repos" / "mujoco_menagerie"
 scene.robot_setup_path = str(menagerie_path)
+scene.robot_library_preview_mode = "DETAILED"
 scene.robot_library_mesh_detail = 0.35
 bpy.ops.robot_library.refresh()
 
@@ -29,6 +30,7 @@ root = blender_addon._place_robot(piper, Vector((0.0, 0.0, 0.0)))
 mesh_objects = [obj for obj in bpy.data.objects if obj.type == "MESH" and obj.name.startswith("Geom:")]
 assert len(mesh_objects) > 10, f"Expected detailed Piper geometry, got {len(mesh_objects)} mesh objects"
 assert root["import_mode"] == "mujoco_compiled"
+assert root["preview_mode"] == "DETAILED"
 assert root["joint_count"] == 8
 assert abs(root["mesh_detail"] - 0.35) < 1e-6
 assert root["triangle_count"] < root["source_triangle_count"]

@@ -3,14 +3,15 @@
 bl_info = {
     "name": "MuJoCo Robot Arm Library",
     "author": "Caryam",
-    "version": (0, 8, 13),
+    "version": (0, 8, 17),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Robot Library",
     "description": "Discover robot arms from a MuJoCo setup and drag them into the scene",
     "category": "3D View",
 }
 
-from .setup_parser import RobotDefinition, discover_robot_definitions
+from .sensor_spec import CameraSensorSpec, LidarSensorSpec, SensorDefinition
+from .setup_parser import RobotDefinition, discover_robot_definitions, discover_sensor_definitions
 
 
 try:
@@ -26,4 +27,7 @@ except ModuleNotFoundError as error:
         return None
 
 
-__all__ = ["RobotDefinition", "discover_robot_definitions", "register", "unregister"]
+__all__ = [
+    "RobotDefinition", "discover_robot_definitions", "SensorDefinition", "LidarSensorSpec",
+    "CameraSensorSpec", "discover_sensor_definitions", "register", "unregister",
+]

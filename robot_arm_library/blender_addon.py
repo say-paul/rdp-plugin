@@ -18,15 +18,18 @@ from bpy.types import Node, NodeTree, Operator, Panel, PropertyGroup, UIList
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 from mathutils import Euler, Matrix, Quaternion, Vector
 
-from .setup_parser import discover_robot_definitions
+from .asset_sources import AssetSource, discover_from_sources
 from .behavior_graph import BehaviorGraph, BehaviorLink, BehaviorNode, PortSpec
-from .world_exporter import RobotInstance, SceneMeshInstance, write_world_export
+from .container_builder import DEFAULT_BASE_IMAGE
+from .port_catalog import catalog_node_template
+from .setup_parser import discover_sensor_definitions
+from .world_exporter import RobotInstance, SceneMeshInstance, SensorMount, write_world_export
 
 
 bl_info = {
     "name": "MuJoCo Robot Arm Library",
     "author": "Caryam",
-    "version": (0, 8, 13),
+    "version": (0, 8, 17),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Robot Library",
     "description": "Discover robot arms from a MuJoCo setup and drag them into the scene",
@@ -59,6 +62,25 @@ class RobotLibraryItem(PropertyGroup):
     instance_count: IntProperty(default=0)
 
 
+class SensorLibraryItem(PropertyGroup):
+    sensor_id: StringProperty()
+    name: StringProperty()
+    category: StringProperty()
+    source_path: StringProperty()
+    description: StringProperty()
+
+
+class RobotAssetSource(PropertyGroup):
+    path: StringProperty(name="Path", default="")
+    kind: EnumProperty(
+        name="Kind",
+        items=(("auto", "Auto", ""), ("robot", "Robot", ""), ("sensor", "Sensor", "")),
+        default="auto",
+    )
+    label: StringProperty(name="Label", default="")
+    enabled: BoolProperty(name="Enabled", default=True)
+
+
 class CaryamBehaviorTree(NodeTree):
     bl_idname = "CARYAM_BEHAVIOR_TREE"
     bl_label = "Caryam Data Graph"
@@ -77,9 +99,7 @@ class CaryamBehaviorTree(NodeTree):
             target_port = next((port for port in target.input_ports if port.port_name == link.to_socket.name), None)
             if source_port is None or target_port is None:
                 continue
-            source_shape = source_port.shape_tuple()
-            target_shape = target_port.shape_tuple()
-            if source_shape and target_shape and source_shape != target_shape:
+            if source_port.to_spec().compatibility_error(target_port.to_spec()):
                 self.links.remove(link)
 
 
@@ -118,6 +138,11 @@ class CaryamPortSpec(PropertyGroup):
         ),
         default="stream",
     )
+    dtype: StringProperty(name="Dtype", default="")
+    semantic: StringProperty(name="Semantic", default="")
+    unit: StringProperty(name="Unit", default="")
+    rate_hz: FloatProperty(name="Rate (Hz)", default=0.0, min=0.0)
+    variable: BoolProperty(name="Variable length", default=False)
 
     def shape_tuple(self) -> tuple[int, ...]:
         if not self.shape_csv.strip():
@@ -128,7 +153,11 @@ class CaryamPortSpec(PropertyGroup):
             return ()
 
     def to_spec(self) -> PortSpec:
-        return PortSpec(self.port_name, self.shape_tuple(), self.data_type, self.delivery)
+        return PortSpec(
+            self.port_name, self.shape_tuple(), self.data_type, self.delivery,
+            dtype=self.dtype, semantic=self.semantic, unit=self.unit,
+            rate_hz=self.rate_hz if self.rate_hz > 0 else None, variable=self.variable,
+        )
 
 
 class CaryamBehaviorNode(Node):
@@ -199,6 +228,8 @@ class CaryamBehaviorNode(Node):
     tactile_mesh: StringProperty(name="Tactile Mesh", default="")
     tactile_threshold: FloatProperty(name="Contact Threshold", default=0.0, min=0.0)
     handler: StringProperty(name="Handler", default="")
+    catalog_locked: BoolProperty(name="Catalog Ports", default=False)
+    catalog_data_json: StringProperty(name="Catalog Data", default="")
     input_ports: CollectionProperty(type=CaryamPortSpec)
     output_ports: CollectionProperty(type=CaryamPortSpec)
 
@@ -274,7 +305,10 @@ class CaryamBehaviorNode(Node):
             layout.label(text="Output: tactile_array")
         elif self.kind in TYPED_DATA_NODE_KINDS:
             layout.prop(self, "handler")
+            if self.catalog_locked:
+                layout.label(text="Catalog ports", icon="LOCKED")
             columns = layout.row()
+            columns.enabled = not self.catalog_locked
             input_column = columns.column()
             input_column.label(text="Inputs")
             for index, port in enumerate(self.input_ports):
@@ -283,6 +317,10 @@ class CaryamBehaviorNode(Node):
                 port_row.prop(port, "shape_csv", text="")
                 port_row.prop(port, "data_type", text="")
                 port_row.prop(port, "delivery", text="")
+                if not self.catalog_locked:
+                    port_row.prop(port, "dtype", text="Dtype")
+                    port_row.prop(port, "semantic", text="Semantic")
+                    port_row.prop(port, "unit", text="Unit")
                 remove = port_row.operator("robot_library.remove_behavior_port", text="", icon="X")
                 remove.direction = "input"
                 remove.port_index = index
@@ -297,6 +335,10 @@ class CaryamBehaviorNode(Node):
                 port_row.prop(port, "shape_csv", text="")
                 port_row.prop(port, "data_type", text="")
                 port_row.prop(port, "delivery", text="")
+                if not self.catalog_locked:
+                    port_row.prop(port, "dtype", text="Dtype")
+                    port_row.prop(port, "semantic", text="Semantic")
+                    port_row.prop(port, "unit", text="Unit")
                 remove = port_row.operator("robot_library.remove_behavior_port", text="", icon="X")
                 remove.direction = "output"
                 remove.port_index = index
@@ -313,6 +355,12 @@ def _behavior_tree(context: bpy.types.Context) -> CaryamBehaviorTree | None:
 
 
 def _node_data(node: CaryamBehaviorNode) -> dict[str, object]:
+    if node.kind == "application" and node.catalog_data_json:
+        try:
+            value = json.loads(node.catalog_data_json)
+            return value if isinstance(value, dict) else {}
+        except ValueError:
+            return {}
     if node.kind == "sensor":
         return {"sensor": node.sensor_path}
     if node.kind == "ai_model":
@@ -368,17 +416,23 @@ def _set_data_ports(
     node.output_ports.clear()
     for spec in inputs:
         port = node.input_ports.add()
-        port.port_name = spec.name
-        port.shape_csv = ",".join(str(value) for value in spec.shape)
-        port.data_type = spec.data_type
-        port.delivery = spec.delivery
+        _set_port_spec(port, spec)
     for spec in outputs:
         port = node.output_ports.add()
-        port.port_name = spec.name
-        port.shape_csv = ",".join(str(value) for value in spec.shape)
-        port.data_type = spec.data_type
-        port.delivery = spec.delivery
+        _set_port_spec(port, spec)
     node.sync_sockets()
+
+
+def _set_port_spec(port: CaryamPortSpec, spec: PortSpec) -> None:
+    port.port_name = spec.name
+    port.shape_csv = ",".join(str(value) for value in spec.shape)
+    port.data_type = spec.data_type
+    port.delivery = spec.delivery
+    port.dtype = spec.dtype
+    port.semantic = spec.semantic
+    port.unit = spec.unit
+    port.rate_hz = spec.rate_hz or 0.0
+    port.variable = spec.variable
 
 
 def _configure_flow_preset(node: CaryamBehaviorNode, preset: str, dof: int) -> None:
@@ -477,6 +531,8 @@ def _populate_behavior_tree(tree: CaryamBehaviorTree, graph: BehaviorGraph) -> N
         node.label = item.label
         node.location = item.position
         node.handler = item.handler
+        node.catalog_data_json = json.dumps(item.data) if item.kind == "application" and item.data else ""
+        node.catalog_locked = bool(item.data.get("catalog_category"))
         data = item.data
         node.sensor_path = str(data.get("sensor", "joint.qpos"))
         node.model_name = str(data.get("model", "rule_based"))
@@ -502,17 +558,11 @@ def _populate_behavior_tree(tree: CaryamBehaviorTree, graph: BehaviorGraph) -> N
             node.input_ports.clear()
             for port in item.inputs:
                 entry = node.input_ports.add()
-                entry.port_name = port.name
-                entry.shape_csv = ",".join(str(value) for value in port.shape)
-                entry.data_type = port.data_type
-                entry.delivery = port.delivery
+                _set_port_spec(entry, port)
             node.output_ports.clear()
             for port in item.outputs:
                 entry = node.output_ports.add()
-                entry.port_name = port.name
-                entry.shape_csv = ",".join(str(value) for value in port.shape)
-                entry.data_type = port.data_type
-                entry.delivery = port.delivery
+                _set_port_spec(entry, port)
         node.sync_sockets()
         node_map[item.node_id] = node
     for link in graph.links:
@@ -568,11 +618,17 @@ def _resolve_setup_path(raw_path: str) -> Path:
     return candidate
 
 
-def _refresh_library(scene: bpy.types.Scene) -> None:
+def _refresh_libraries(scene: bpy.types.Scene) -> None:
     setup_path = _resolve_setup_path(scene.robot_setup_path)
+    sources = [AssetSource(str(setup_path), "auto", "Primary")]
+    for item in scene.robot_asset_sources:
+        if item.path.strip():
+            extra_path = Path(bpy.path.abspath(item.path)).expanduser().resolve()
+            sources.append(AssetSource(str(extra_path), item.kind, item.label or item.path, item.enabled))
     scene.robot_library.clear()
+    scene.sensor_library.clear()
     try:
-        definitions = discover_robot_definitions(setup_path)
+        definitions, sensors = discover_from_sources(sources)
     except Exception as error:
         scene.robot_library_status = f"Cannot read setup: {error}"
         return
@@ -586,18 +642,32 @@ def _refresh_library(scene: bpy.types.Scene) -> None:
         item.description = definition.description
         item.category = definition.category
 
+    for definition in sensors:
+        item = scene.sensor_library.add()
+        item.sensor_id = definition.sensor_id
+        item.name = definition.name
+        item.category = definition.category
+        item.source_path = definition.source_path
+        item.description = definition.description
+
     if definitions:
-        scene.robot_library_status = f"{len(definitions)} robot(s) found in {setup_path}"
+        scene.robot_library_status = f"{len(definitions)} robot(s), {len(sensors)} sensor(s) found"
         scene.robot_library_index = min(scene.robot_library_index, len(definitions) - 1)
     else:
-        scene.robot_library_status = f"No robot arms found in {setup_path}"
+        scene.robot_library_status = f"No robot arms found in {setup_path}; {len(sensors)} sensor(s) found"
         scene.robot_library_index = 0
+    scene.sensor_library_index = min(scene.sensor_library_index, max(len(sensors) - 1, 0))
+
+
+def _refresh_library(scene: bpy.types.Scene) -> None:
+    """Keep the existing internal single-source refresh entry point."""
+    _refresh_libraries(scene)
 
 
 def _refresh_active_library() -> None:
     scene = getattr(bpy.context, "scene", None)
     if scene is not None and hasattr(scene, "robot_library"):
-        _refresh_library(scene)
+        _refresh_libraries(scene)
     return None
 
 
@@ -853,11 +923,17 @@ def _place_robot(item: RobotLibraryItem, location: Vector) -> bpy.types.Object:
                         root,
                         robot_collection,
                         include_collisions=bpy.context.scene.robot_library_include_collisions,
+                        mesh_detail=bpy.context.scene.robot_library_mesh_detail,
+                        preview_mode=bpy.context.scene.robot_library_preview_mode,
                     )
                     hierarchy_created = bool(imported)
-                except (ImportError, ModuleNotFoundError, RuntimeError, ValueError):
-                    imported = _import_mjcf_meshes(asset_path)
-                    root["import_mode"] = "xml_fallback"
+                except (ImportError, ModuleNotFoundError, RuntimeError, ValueError) as error:
+                    if bpy.context.scene.robot_library_preview_mode == "DETAILED":
+                        imported = _import_mjcf_meshes(asset_path)
+                        root["import_mode"] = "xml_fallback"
+                    else:
+                        root["import_mode"] = "proxy_unavailable"
+                        root["import_error"] = str(error)
             elif asset_path.suffix.lower() in SUPPORTED_IMPORT_EXTENSIONS:
                 imported = _import_mesh_file(asset_path)
         except (OSError, RuntimeError):
@@ -865,7 +941,8 @@ def _place_robot(item: RobotLibraryItem, location: Vector) -> bpy.types.Object:
 
     if not imported:
         imported = _create_placeholder(item.name)
-        root["import_mode"] = "placeholder"
+        if "import_mode" not in root:
+            root["import_mode"] = "placeholder"
     if not hierarchy_created:
         _parent_objects(imported, root)
     item.instance_count += 1
@@ -896,9 +973,49 @@ def _world_robot_instances() -> list[RobotInstance]:
                 position=position,
                 quaternion=quaternion,
                 qpos=qpos,
+                sensors=tuple(_sensor_mounts(root)),
             )
         )
     return instances
+
+
+def _sensor_mounts(root: bpy.types.Object) -> list[SensorMount]:
+    mounts: list[SensorMount] = []
+    for obj in sorted(bpy.context.scene.objects, key=lambda item: item.name):
+        if not obj.get("sensor_id"):
+            continue
+        ancestor = obj
+        while ancestor.parent is not None and ancestor is not root:
+            ancestor = ancestor.parent
+        if ancestor is not root:
+            continue
+        source_path = str(obj.get("sensor_source_path", ""))
+        payload = str(obj.get("sensor_definition_json", ""))
+        try:
+            if payload:
+                from .sensor_spec import SensorDefinition
+                definition = SensorDefinition.from_dict(str(obj["sensor_id"]), json.loads(payload), source_path)
+            else:
+                definition = next(
+                    sensor for sensor in discover_sensor_definitions(source_path)
+                    if sensor.sensor_id == str(obj["sensor_id"])
+                )
+        except (OSError, ValueError, StopIteration, TypeError):
+            continue
+        parent_body = obj.parent
+        while parent_body is not None and parent_body is not root and not parent_body.name.startswith("Body: "):
+            parent_body = parent_body.parent
+        body_name = parent_body.name.removeprefix("Body: ") if parent_body is not None and parent_body is not root else ""
+        frame = parent_body if parent_body is not None else root
+        local_matrix = frame.matrix_world.inverted() @ obj.matrix_world
+        mounts.append(SensorMount(
+            definition,
+            obj.name.removeprefix("Sensor: ").lower().replace(" ", "_").replace(".", "_"),
+            tuple(float(value) for value in local_matrix.translation),
+            tuple(float(value) for value in local_matrix.to_quaternion()),
+            body_name,
+        ))
+    return mounts
 
 
 def _is_robot_library_object(obj: bpy.types.Object) -> bool:
@@ -943,8 +1060,8 @@ def _write_scene_obj(objects: Iterable[bpy.types.Object], output_path: Path, wor
 def _is_dynamic_scene_object(obj: bpy.types.Object) -> bool:
     rigid_body = obj.rigid_body
     return bool(obj.get("mujoco_dynamic", False)) or (
-        rigid_body is not None and rigid_body.type == "ACTIVE"
-    ) or "ball" in obj.name.lower()
+        rigid_body is not None and rigid_body.enabled and rigid_body.type == "ACTIVE" and not rigid_body.kinematic
+    )
 
 
 def _scene_object_rgba(obj: bpy.types.Object) -> tuple[float, float, float, float]:
@@ -979,6 +1096,10 @@ def _world_scene_meshes(output: Path) -> list[SceneMeshInstance]:
                 scale=tuple(abs(float(value)) for value in scale),
                 dynamic=_is_dynamic_scene_object(obj),
                 mass=mass,
+                collision_shape=rigid_body.collision_shape if rigid_body is not None else "MESH",
+                collision_enabled=rigid_body is None or rigid_body.enabled or bool(obj.get("mujoco_dynamic", False)),
+                friction=float(rigid_body.friction) if rigid_body is not None else None,
+                restitution=float(rigid_body.restitution) if rigid_body is not None else 0.0,
             )
         )
     return scene_meshes
@@ -1139,7 +1260,7 @@ class ROBOT_OT_refresh(Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        _refresh_library(context.scene)
+        _refresh_libraries(context.scene)
         return {"FINISHED"}
 
 
@@ -1157,6 +1278,9 @@ class ROBOT_OT_add(Operator):
             return {"CANCELLED"}
         item = items[self.robot_index]
         root = _place_robot(item, _add_location(context.scene))
+        if root.get("import_mode") == "proxy_unavailable":
+            self.report({"WARNING"}, "Fast Assembly needs MuJoCo in Blender; added a placeholder")
+            return {"FINISHED"}
         self.report(
             {"INFO"},
             f"{item.name}: {root.get('joint_count', 0)} joints, {root.get('collision_count', 0)} collision geoms",
@@ -1196,6 +1320,9 @@ class ROBOT_OT_drag(Operator):
                 return {"CANCELLED"}
             item = context.scene.robot_library[self.robot_index]
             root = _place_robot(item, location)
+            if root.get("import_mode") == "proxy_unavailable":
+                self.report({"WARNING"}, "Fast Assembly needs MuJoCo in Blender; added a placeholder")
+                return {"FINISHED"}
             self.report(
                 {"INFO"},
                 f"{item.name}: {root.get('joint_count', 0)} joints, {root.get('collision_count', 0)} collision geoms",
@@ -1211,6 +1338,34 @@ class ROBOT_OT_clear_filter(Operator):
     def execute(self, context: bpy.types.Context) -> set[str]:
         context.scene.robot_library_filter = ""
         return {"FINISHED"}
+
+
+class ROBOT_OT_add_asset_source(Operator):
+    bl_idname = "robot_library.add_asset_source"
+    bl_label = "Add Asset Source"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        item = context.scene.robot_asset_sources.add()
+        item.path = str(Path.home() / "git_repos" / "sensor_menagerie")
+        item.kind = "sensor"
+        item.label = "Sensor Menagerie"
+        return {"FINISHED"}
+
+
+class ROBOT_OT_remove_asset_source(Operator):
+    bl_idname = "robot_library.remove_asset_source"
+    bl_label = "Remove Asset Source"
+    bl_options = {"REGISTER", "UNDO"}
+
+    source_index: IntProperty()
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        sources = context.scene.robot_asset_sources
+        if 0 <= self.source_index < len(sources):
+            sources.remove(self.source_index)
+            return {"FINISHED"}
+        return {"CANCELLED"}
 
 
 class ROBOT_OT_reset_pose(Operator):
@@ -1272,9 +1427,17 @@ class ROBOT_OT_export_world(Operator, ExportHelper):
         return {"FINISHED"}
 
 
-class ROBOT_OT_export_and_render(ROBOT_OT_export_world):
+class ROBOT_OT_export_and_render(Operator, ExportHelper):
     bl_idname = "robot_library.export_and_render"
     bl_label = "Export and Render in MuJoCo"
+    bl_options = {"REGISTER"}
+
+    filename_ext = ".xml"
+    filter_glob: StringProperty(default="*.xml", options={"HIDDEN"})
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        self.filepath = bpy.path.abspath("//caryam_world.xml")
+        return ExportHelper.invoke(self, context, event)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         try:
@@ -1299,7 +1462,7 @@ class ROBOT_OT_launch_mujoco(Operator):
             world_path, _manifest_path, render_path = _export_world_file(output_path)
             executable = context.scene.robot_mujoco_python.strip() or shutil.which("python") or "python"
             subprocess.Popen([executable, str(render_path)], cwd=str(render_path.parent), start_new_session=True)
-        except (OSError, ValueError) as error:
+        except (OSError, RuntimeError, ValueError) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
         self.report({"INFO"}, f"Launched MuJoCo simulation for {world_path.name}")
@@ -1490,6 +1653,53 @@ class ROBOT_OT_add_behavior_node(Operator):
         return {"FINISHED"}
 
 
+class ROBOT_OT_add_catalog_node(Operator):
+    bl_idname = "robot_library.add_catalog_node"
+    bl_label = "Add Catalog Node"
+    bl_options = {"REGISTER", "UNDO"}
+
+    template: EnumProperty(
+        name="Template",
+        items=(
+            ("robot_state", "Robot State", "Robot joint state outputs"),
+            ("robot_command", "Robot Command", "Robot joint command input"),
+            ("selected_sensor", "Selected Sensor", "Ports from the selected sensor definition"),
+        ),
+        default="selected_sensor",
+    )
+    sensor_index: IntProperty(default=-1)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        tree = _behavior_tree(context) or _ensure_behavior_tree(context.scene)
+        node_id = f"{self.template}_{len(tree.nodes) + 1}"
+        if self.template == "selected_sensor":
+            index = self.sensor_index if self.sensor_index >= 0 else context.scene.sensor_library_index
+            if not 0 <= index < len(context.scene.sensor_library):
+                self.report({"WARNING"}, "Select a catalog sensor first")
+                return {"CANCELLED"}
+            item = context.scene.sensor_library[index]
+            definition = next(
+                (sensor for sensor in discover_sensor_definitions(item.source_path) if sensor.sensor_id == item.sensor_id),
+                None,
+            )
+            if definition is None:
+                self.report({"ERROR"}, "Sensor definition is no longer available")
+                return {"CANCELLED"}
+            entry = definition.to_dict()
+            node_id = f"{item.sensor_id}_{len(tree.nodes) + 1}"
+        else:
+            entry = {"category": self.template, "name": self.template.replace("_", " ").title(), "dof": _flow_dof(context)}
+        template = catalog_node_template(node_id, entry)
+        node = tree.nodes.new("CARYAM_BEHAVIOR_NODE")
+        node.node_id = template.node_id
+        node.label = template.label
+        _set_data_ports(node, "application", template.inputs, template.outputs)
+        node.catalog_locked = True
+        node.catalog_data_json = json.dumps(template.data)
+        node.location = (len(tree.nodes) * 180.0, 0.0)
+        return {"FINISHED"}
+
+
 def _draw_behavior_add_menu(menu: bpy.types.Menu, context: bpy.types.Context) -> None:
     space_data = getattr(context, "space_data", None)
     if getattr(space_data, "tree_type", "") != "CARYAM_BEHAVIOR_TREE":
@@ -1532,6 +1742,9 @@ class ROBOT_OT_add_port(Operator):
         if not isinstance(node, CaryamBehaviorNode) or node.kind not in PORT_CONFIGURABLE_NODE_KINDS:
             self.report({"WARNING"}, "Select an Application node first")
             return {"CANCELLED"}
+        if node.catalog_locked:
+            self.report({"WARNING"}, "Catalog ports are read-only")
+            return {"CANCELLED"}
         ports = node.input_ports if self.direction == "input" else node.output_ports
         entry = ports.add()
         entry.port_name = f"{self.direction}_{len(ports)}"
@@ -1553,6 +1766,8 @@ class ROBOT_OT_remove_port(Operator):
     def execute(self, context: bpy.types.Context) -> set[str]:
         node = context.active_node
         if not isinstance(node, CaryamBehaviorNode) or node.kind not in PORT_CONFIGURABLE_NODE_KINDS:
+            return {"CANCELLED"}
+        if node.catalog_locked:
             return {"CANCELLED"}
         ports = node.input_ports if self.direction == "input" else node.output_ports
         if 0 <= self.port_index < len(ports):
@@ -1587,7 +1802,7 @@ class ROBOT_OT_save_behavior(Operator, ExportHelper):
     bl_options = {"REGISTER"}
 
     filename_ext = ".json"
-    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.json;*.yaml;*.yml", options={"HIDDEN"})
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         tree = _behavior_tree(context) or _ensure_behavior_tree(context.scene)
@@ -1596,8 +1811,16 @@ class ROBOT_OT_save_behavior(Operator, ExportHelper):
         if errors:
             self.report({"ERROR"}, "; ".join(errors))
             return {"CANCELLED"}
-        graph.save(self.filepath)
-        self.report({"INFO"}, f"Saved {Path(self.filepath).name}")
+        path = Path(self.filepath)
+        try:
+            if path.suffix.lower() in {".yaml", ".yml"}:
+                graph.save_flow_yaml(path)
+            else:
+                graph.save(path)
+        except (OSError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Saved {path.name}")
         return {"FINISHED"}
 
 
@@ -1607,12 +1830,13 @@ class ROBOT_OT_load_behavior(Operator, ImportHelper):
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".json"
-    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.json;*.yaml;*.yml", options={"HIDDEN"})
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         try:
-            graph = BehaviorGraph.load(self.filepath)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
+            path = Path(self.filepath)
+            graph = BehaviorGraph.load_flow_yaml(path) if path.suffix.lower() in {".yaml", ".yml"} else BehaviorGraph.load(path)
+        except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
         tree = _behavior_tree(context) or _ensure_behavior_tree(context.scene)
@@ -1658,6 +1882,207 @@ class ROBOT_OT_joint_window(Operator):
         _draw_joint_controls(self.layout, root, _joint_controls(root))
 
     def execute(self, context: bpy.types.Context) -> set[str]:
+        return {"FINISHED"}
+
+
+class ROBOT_OT_attach_sensor(Operator):
+    bl_idname = "robot_library.attach_sensor"
+    bl_label = "Attach Sensor to Body"
+    bl_options = {"REGISTER", "UNDO"}
+
+    sensor_index: IntProperty(default=-1)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        scene = context.scene
+        index = self.sensor_index if self.sensor_index >= 0 else scene.sensor_library_index
+        if not 0 <= index < len(scene.sensor_library):
+            self.report({"WARNING"}, "Select a sensor first")
+            return {"CANCELLED"}
+        target = context.active_object
+        robot_root = _selected_robot_root(target)
+        if target is None or robot_root is None:
+            self.report({"WARNING"}, "Select an imported robot body first")
+            return {"CANCELLED"}
+        if target is robot_root:
+            top_bodies = [child for child in robot_root.children if child.name.startswith("Body: ")]
+            if len(top_bodies) == 1:
+                target = top_bodies[0]
+            elif len(top_bodies) > 1:
+                self.report({"WARNING"}, "Select a specific robot body")
+                return {"CANCELLED"}
+        item = scene.sensor_library[index]
+        definition = next(
+            (sensor for sensor in discover_sensor_definitions(item.source_path) if sensor.sensor_id == item.sensor_id),
+            None,
+        )
+        if definition is None:
+            self.report({"ERROR"}, "Sensor definition is no longer available")
+            return {"CANCELLED"}
+        mount = bpy.data.objects.new(f"Sensor: {item.name}", None)
+        mount.empty_display_type = "SPHERE"
+        mount.empty_display_size = 0.03
+        mount["sensor_id"] = item.sensor_id
+        mount["sensor_category"] = item.category
+        mount["sensor_source_path"] = item.source_path
+        mount["sensor_definition_json"] = json.dumps(definition.to_dict())
+        _robot_collection().objects.link(mount)
+        mount.parent = target
+        mount.matrix_parent_inverse = Matrix.Identity(4)
+        mount.location = (0.0, 0.0, 0.0)
+        mount.rotation_euler = (0.0, 0.0, 0.0)
+        return {"FINISHED"}
+
+
+class ROBOT_OT_ros_list_topics(Operator):
+    bl_idname = "robot_library.ros_list_topics"
+    bl_label = "List ROS Topics"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from . import ros_bridge
+        try:
+            topics = ros_bridge.list_topics(context.scene.robot_ros_distro)
+        except (ros_bridge.RosCommandError, ValueError) as error:
+            context.scene.robot_ros_status = f"Error: {error}"
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        context.scene.robot_ros_status = "; ".join(topics) if topics else "No topics found"
+        return {"FINISHED"}
+
+
+class ROBOT_OT_ros_echo_topic(Operator):
+    bl_idname = "robot_library.ros_echo_topic"
+    bl_label = "Echo ROS Topic Once"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from . import ros_bridge
+        scene = context.scene
+        try:
+            scene.robot_ros_status = ros_bridge.echo_topic(scene.robot_ros_distro, scene.robot_ros_topic)
+        except (ros_bridge.RosCommandError, ValueError) as error:
+            scene.robot_ros_status = f"Error: {error}"
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class ROBOT_OT_ros_publish_topic(Operator):
+    bl_idname = "robot_library.ros_publish_topic"
+    bl_label = "Publish ROS Topic Once"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from . import ros_bridge
+        scene = context.scene
+        try:
+            ros_bridge.publish_topic(
+                scene.robot_ros_distro, scene.robot_ros_topic,
+                scene.robot_ros_message_type, scene.robot_ros_payload,
+            )
+        except (ros_bridge.RosCommandError, ValueError) as error:
+            scene.robot_ros_status = f"Error: {error}"
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        scene.robot_ros_status = f"Published to {scene.robot_ros_topic}"
+        return {"FINISHED"}
+
+
+class ROBOT_OT_ros_launch_rviz(Operator):
+    bl_idname = "robot_library.ros_launch_rviz"
+    bl_label = "Launch RViz"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from . import ros_bridge
+        try:
+            ros_bridge.launch_rviz(context.scene.robot_ros_distro)
+        except (ros_bridge.RosCommandError, ValueError) as error:
+            context.scene.robot_ros_status = f"Error: {error}"
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        context.scene.robot_ros_status = "RViz launched"
+        return {"FINISHED"}
+
+
+class ROBOT_OT_generate_containerfile(Operator):
+    bl_idname = "robot_library.generate_containerfile"
+    bl_label = "Generate Containerfile"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from . import container_builder
+        scene = context.scene
+        try:
+            content = container_builder.render_containerfile(
+                scene.robot_build_base_image, [], "/opt/caryam/entrypoint.sh",
+            )
+            build_dir = _blend_directory() / "build"
+            path = container_builder.write_containerfile(build_dir, content)
+            payload = build_dir / "caryam_payload"
+            payload.mkdir(exist_ok=True)
+            entrypoint = payload / "entrypoint.sh"
+            if not entrypoint.exists():
+                entrypoint.write_text("#!/bin/sh\nexec /sbin/init \"$@\"\n", encoding="utf-8")
+            entrypoint.chmod(0o755)
+        except (OSError, ValueError) as error:
+            scene.robot_build_status = f"Error: {error}"
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        scene.robot_build_status = f"Wrote {path}"
+        return {"FINISHED"}
+
+
+class ROBOT_OT_build_container_image(Operator):
+    bl_idname = "robot_library.build_container_image"
+    bl_label = "Build Container Image"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from . import container_builder
+        scene = context.scene
+        build_dir = _blend_directory() / "build"
+        containerfile = build_dir / "Containerfile"
+        if not containerfile.is_file():
+            self.report({"ERROR"}, "Generate the Containerfile first")
+            return {"CANCELLED"}
+        try:
+            tag = container_builder.image_tag(scene.robot_build_oci_name)
+            command = container_builder.build_image_command(scene.robot_build_tool, tag, containerfile, build_dir)
+            subprocess.Popen(command, cwd=str(build_dir), start_new_session=True)
+        except (OSError, ValueError) as error:
+            scene.robot_build_status = f"Error: {error}"
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        scene.robot_build_status = f"Building {tag}"
+        return {"FINISHED"}
+
+
+class ROBOT_OT_flash_bootc_image(Operator):
+    bl_idname = "robot_library.flash_bootc_image"
+    bl_label = "Flash bootc Image to Disk"
+    bl_options = {"REGISTER"}
+    confirmed: BoolProperty(default=False, options={"HIDDEN"})
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        self.confirmed = True
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        if not self.confirmed:
+            self.report({"WARNING"}, "Confirm the target disk in the dialog before flashing")
+            return {"CANCELLED"}
+        from . import container_builder
+        scene = context.scene
+        try:
+            tag = container_builder.image_tag(scene.robot_build_oci_name)
+            command = container_builder.bootc_install_command(scene.robot_build_tool, tag, scene.robot_build_target_disk)
+            subprocess.Popen(command, start_new_session=True)
+        except (OSError, ValueError) as error:
+            scene.robot_build_status = f"Error: {error}"
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        scene.robot_build_status = f"Flashing {tag} to {scene.robot_build_target_disk}"
         return {"FINISHED"}
 
 
@@ -1711,6 +2136,16 @@ class ROBOT_PT_library(Panel):
         filter_row = layout.row(align=True)
         filter_row.prop(scene, "robot_library_filter", text="", icon="VIEWZOOM")
         filter_row.operator("robot_library.clear_filter", text="", icon="X")
+        sources_box = layout.box()
+        sources_box.label(text="Additional Asset Sources")
+        for index, source in enumerate(scene.robot_asset_sources):
+            row = sources_box.row(align=True)
+            row.prop(source, "enabled", text="")
+            row.prop(source, "path", text="")
+            row.prop(source, "kind", text="")
+            remove = row.operator("robot_library.remove_asset_source", text="", icon="X")
+            remove.source_index = index
+        sources_box.operator("robot_library.add_asset_source", text="Add Source", icon="ADD")
         visible_count = sum(
             not scene.robot_library_filter.strip().lower()
             or scene.robot_library_filter.strip().lower() in f"{item.name} {item.category}".lower()
@@ -1741,12 +2176,25 @@ class ROBOT_PT_library(Panel):
         options_box.label(text="Import Options")
         options_box.prop(scene, "robot_library_auto_spread", text="Auto-space Add")
         options_box.prop(scene, "robot_library_include_collisions", text="Load Collision Geoms")
+        options_box.prop(scene, "robot_library_preview_mode", text="Robot Geometry")
+        if scene.robot_library_preview_mode == "DETAILED":
+            options_box.prop(scene, "robot_library_mesh_detail", text="Mesh Detail")
         add_row = layout.row(align=True)
         add_operator = add_row.operator("robot_library.add_robot", text="Add to World", icon="ADD")
         add_operator.robot_index = scene.robot_library_index
         drag_operator = add_row.operator("robot_library.drag_robot", text="Drag into Viewport", icon="HAND")
         drag_operator.robot_index = scene.robot_library_index
         layout.operator("robot_library.joint_window", text="Open Joint Controller", icon="CONSTRAINT_BONE")
+
+
+class ROBOT_UL_sensor_library(UIList):
+    def draw_item(
+        self, context: bpy.types.Context, layout: bpy.types.UILayout, data: object,
+        item: SensorLibraryItem, icon: int, active_data: object, active_propname: str,
+        index: int, flt_flag: int = 0,
+    ) -> None:
+        icon_name = "OUTLINER_OB_CAMERA" if item.category == "depth_camera" else "OUTLINER_OB_FORCE_FIELD"
+        layout.label(text=f"{index + 1:03d}  {item.name}", icon=icon_name)
 
 
 class ROBOT_PT_sensor_library(Panel):
@@ -1757,7 +2205,21 @@ class ROBOT_PT_sensor_library(Panel):
     bl_category = "Robot Library"
 
     def draw(self, context: bpy.types.Context) -> None:
-        self.layout.label(text="Sensor library is not configured", icon="INFO")
+        layout = self.layout
+        scene = context.scene
+        if not scene.sensor_library:
+            layout.label(text="No sensors discovered", icon="INFO")
+            layout.label(text="Add a sensor source and refresh", icon="INFO")
+            return
+        layout.template_list(
+            "ROBOT_UL_sensor_library", "sensor_library", scene, "sensor_library",
+            scene, "sensor_library_index", rows=4,
+        )
+        index = min(scene.sensor_library_index, len(scene.sensor_library) - 1)
+        item = scene.sensor_library[index]
+        layout.label(text=item.category.replace("_", " ").title())
+        attach = layout.operator("robot_library.attach_sensor", text="Attach to Selected Body", icon="CONSTRAINT_BONE")
+        attach.sensor_index = index
 
 
 class ROBOT_PT_joint_controls(Panel):
@@ -1795,6 +2257,24 @@ class ROBOT_PT_mujoco_world(Panel):
         row = layout.row(align=True)
         row.operator("robot_library.export_world", text="Export", icon="EXPORT")
         row.operator("robot_library.launch_mujoco", text="Play", icon="PLAY")
+        obj = context.active_object
+        if obj is None:
+            layout.label(text="Select a mesh to inspect physics", icon="INFO")
+            return
+        if _is_robot_library_object(obj):
+            layout.label(text="Robot physics comes from its MJCF", icon="INFO")
+        elif obj.type != "MESH":
+            layout.label(text="Selected item is not a mesh", icon="INFO")
+        elif obj.hide_render:
+            layout.label(text="Selected mesh is excluded from export", icon="ERROR")
+        elif obj.rigid_body is not None and not obj.rigid_body.enabled and not obj.get("mujoco_dynamic", False):
+            layout.label(text="Selected mesh: Dynamic is off", icon="INFO")
+        elif obj.rigid_body is not None and obj.rigid_body.kinematic and not obj.get("mujoco_dynamic", False):
+            layout.label(text="Selected mesh: Animated is on", icon="INFO")
+        elif _is_dynamic_scene_object(obj):
+            layout.label(text="Selected mesh: dynamic in MuJoCo", icon="CHECKMARK")
+        else:
+            layout.label(text="Selected mesh: fixed collider", icon="INFO")
 
 
 class ROBOT_PT_core_simulation(Panel):
@@ -1861,14 +2341,45 @@ class ROBOT_PT_behavior_graph(Panel):
 
 
 class ROBOT_PT_rcs_control(Panel):
-    bl_label = "RCS Control"
+    bl_label = "ROS Control"
     bl_idname = "ROBOT_PT_rcs_control"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Robot Control"
 
     def draw(self, context: bpy.types.Context) -> None:
-        self.layout.label(text="RCS control is not configured", icon="INFO")
+        layout = self.layout
+        scene = context.scene
+        layout.prop(scene, "robot_ros_distro", text="ROS")
+        layout.operator("robot_library.ros_launch_rviz", text="Launch RViz", icon="RESTRICT_VIEW_OFF")
+        layout.operator("robot_library.ros_list_topics", text="List Topics", icon="FILE_REFRESH")
+        layout.prop(scene, "robot_ros_topic", text="Topic")
+        layout.operator("robot_library.ros_echo_topic", text="Echo Once", icon="PLAY")
+        layout.prop(scene, "robot_ros_message_type", text="Type")
+        layout.prop(scene, "robot_ros_payload", text="Payload")
+        layout.operator("robot_library.ros_publish_topic", text="Publish Once", icon="EXPORT")
+        layout.label(text=scene.robot_ros_status)
+
+
+class ROBOT_PT_robot_build(Panel):
+    bl_label = "Container Build"
+    bl_idname = "ROBOT_PT_robot_build"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Robot Build"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        scene = context.scene
+        layout.prop(scene, "robot_build_oci_name", text="Image Name")
+        layout.prop(scene, "robot_build_base_image", text="Base Image")
+        layout.prop(scene, "robot_build_tool", text="Tool")
+        layout.operator("robot_library.generate_containerfile", text="Generate Containerfile", icon="FILE_NEW")
+        layout.operator("robot_library.build_container_image", text="Build Image", icon="PACKAGE")
+        layout.separator()
+        layout.prop(scene, "robot_build_target_disk", text="Target Disk")
+        layout.operator("robot_library.flash_bootc_image", text="Flash to Disk", icon="EXPORT")
+        layout.label(text=scene.robot_build_status)
 
 
 class ROBOT_PT_behavior_editor(Panel):
@@ -1900,6 +2411,13 @@ class ROBOT_PT_behavior_editor(Panel):
         ):
             operator = layout.operator("robot_library.add_behavior_node", text=label, icon=icon)
             operator.preset = preset
+        layout.label(text="Catalog Nodes")
+        for template, label in (("robot_state", "Robot State"), ("robot_command", "Robot Command")):
+            operator = layout.operator("robot_library.add_catalog_node", text=label, icon="NODE")
+            operator.template = template
+        if context.scene.sensor_library:
+            operator = layout.operator("robot_library.add_catalog_node", text="Selected Sensor", icon="OUTLINER_OB_CAMERA")
+            operator.template = "selected_sensor"
         layout.separator()
         layout.label(text="Add Control Node")
         for kind, label, icon in (
@@ -1921,6 +2439,8 @@ class ROBOT_PT_behavior_editor(Panel):
 
 CLASSES = (
     RobotLibraryItem,
+    SensorLibraryItem,
+    RobotAssetSource,
     CaryamBehaviorTree,
     CaryamPortSpec,
     CaryamBehaviorNode,
@@ -1928,6 +2448,8 @@ CLASSES = (
     ROBOT_OT_add,
     ROBOT_OT_drag,
     ROBOT_OT_clear_filter,
+    ROBOT_OT_add_asset_source,
+    ROBOT_OT_remove_asset_source,
     ROBOT_OT_reset_pose,
     ROBOT_OT_keyframe_pose,
     ROBOT_OT_export_world,
@@ -1939,6 +2461,7 @@ CLASSES = (
     ROBOT_OT_open_behavior_editor,
     ROBOT_OT_new_behavior,
     ROBOT_OT_add_behavior_node,
+    ROBOT_OT_add_catalog_node,
     ROBOT_OT_add_port,
     ROBOT_OT_remove_port,
     ROBOT_OT_delete_data_node,
@@ -1946,7 +2469,16 @@ CLASSES = (
     ROBOT_OT_load_behavior,
     ROBOT_OT_run_behavior,
     ROBOT_OT_joint_window,
+    ROBOT_OT_attach_sensor,
+    ROBOT_OT_ros_list_topics,
+    ROBOT_OT_ros_echo_topic,
+    ROBOT_OT_ros_publish_topic,
+    ROBOT_OT_ros_launch_rviz,
+    ROBOT_OT_generate_containerfile,
+    ROBOT_OT_build_container_image,
+    ROBOT_OT_flash_bootc_image,
     ROBOT_UL_library,
+    ROBOT_UL_sensor_library,
     ROBOT_PT_library,
     ROBOT_PT_sensor_library,
     ROBOT_PT_joint_controls,
@@ -1956,6 +2488,7 @@ CLASSES = (
     ROBOT_PT_gazebo_world,
     ROBOT_PT_behavior_graph,
     ROBOT_PT_rcs_control,
+    ROBOT_PT_robot_build,
     ROBOT_PT_behavior_editor,
 )
 
@@ -1967,8 +2500,13 @@ def _remove_scene_properties() -> None:
         "robot_library_status",
         "robot_library_filter",
         "robot_setup_path",
+        "robot_asset_sources",
+        "sensor_library",
+        "sensor_library_index",
         "robot_library_auto_spread",
         "robot_library_include_collisions",
+        "robot_library_preview_mode",
+        "robot_library_mesh_detail",
         "robot_library_control_root",
         "robot_mujoco_python",
         "robot_core_bridge_url",
@@ -1978,6 +2516,16 @@ def _remove_scene_properties() -> None:
         "robot_core_log",
         "robot_core_command_valid",
         "robot_behavior_tree",
+        "robot_ros_distro",
+        "robot_ros_topic",
+        "robot_ros_message_type",
+        "robot_ros_payload",
+        "robot_ros_status",
+        "robot_build_oci_name",
+        "robot_build_base_image",
+        "robot_build_tool",
+        "robot_build_target_disk",
+        "robot_build_status",
     ):
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
@@ -2006,8 +2554,23 @@ def register() -> None:
     bpy.types.Scene.robot_library_status = StringProperty(name="Status", default="Refresh to discover robot arms")
     bpy.types.Scene.robot_library_index = IntProperty(name="Robot", default=0, min=0)
     bpy.types.Scene.robot_library = CollectionProperty(type=RobotLibraryItem)
+    bpy.types.Scene.robot_asset_sources = CollectionProperty(type=RobotAssetSource)
+    bpy.types.Scene.sensor_library = CollectionProperty(type=SensorLibraryItem)
+    bpy.types.Scene.sensor_library_index = IntProperty(name="Sensor", default=0, min=0)
     bpy.types.Scene.robot_library_auto_spread = BoolProperty(name="Auto-space Add", default=True)
     bpy.types.Scene.robot_library_include_collisions = BoolProperty(name="Load Collision Geoms", default=False)
+    bpy.types.Scene.robot_library_preview_mode = EnumProperty(
+        name="Robot Geometry",
+        items=(
+            ("PROXY", "Fast Assembly", "Use small bounding boxes for robot geometry in Blender"),
+            ("DETAILED", "Detailed Mesh", "Load the robot's visual meshes into Blender"),
+        ),
+        default="PROXY",
+    )
+    bpy.types.Scene.robot_library_mesh_detail = FloatProperty(
+        name="Mesh Detail", description="Fraction of source triangles kept in Detailed Mesh mode",
+        default=1.0, min=0.01, max=1.0,
+    )
     bpy.types.Scene.robot_library_control_root = PointerProperty(name="Controlled Robot", type=bpy.types.Object)
     bpy.types.Scene.robot_mujoco_python = StringProperty(name="MuJoCo Python", default="python")
     bpy.types.Scene.robot_core_bridge_url = StringProperty(name="Core Bridge", default="http://127.0.0.1:8765")
@@ -2017,6 +2580,20 @@ def register() -> None:
     bpy.types.Scene.robot_core_log = StringProperty(name="Core Log")
     bpy.types.Scene.robot_core_command_valid = BoolProperty(name="Core Command Valid", default=False)
     bpy.types.Scene.robot_behavior_tree = PointerProperty(name="Data Graph", type=CaryamBehaviorTree)
+    bpy.types.Scene.robot_ros_distro = EnumProperty(
+        name="ROS", items=(("ros1", "ROS 1", ""), ("ros2", "ROS 2", "")), default="ros2",
+    )
+    bpy.types.Scene.robot_ros_topic = StringProperty(name="Topic", default="/joint_states")
+    bpy.types.Scene.robot_ros_message_type = StringProperty(name="Type", default="std_msgs/Float64")
+    bpy.types.Scene.robot_ros_payload = StringProperty(name="Payload", default="data: 0.0")
+    bpy.types.Scene.robot_ros_status = StringProperty(name="ROS Status", default="Not checked")
+    bpy.types.Scene.robot_build_oci_name = StringProperty(name="Image", default="caryam-robot")
+    bpy.types.Scene.robot_build_base_image = StringProperty(name="Base Image", default=DEFAULT_BASE_IMAGE)
+    bpy.types.Scene.robot_build_tool = EnumProperty(
+        name="Tool", items=(("podman", "Podman", ""), ("docker", "Docker", "")), default="podman",
+    )
+    bpy.types.Scene.robot_build_target_disk = StringProperty(name="Target Disk", default="")
+    bpy.types.Scene.robot_build_status = StringProperty(name="Build Status", default="Not built")
     bpy.types.NODE_MT_add.append(_draw_behavior_add_menu)
     bpy.app.timers.register(_refresh_active_library, first_interval=0.1)
 

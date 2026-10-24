@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import xml.etree.ElementTree as ElementTree
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
+
+from .sensor_compilers.mujoco import compile_depth_camera, compile_lidar
+from .sensor_spec import CameraSensorSpec, LidarSensorSpec, SensorDefinition
+
+
+_PRIMITIVE_COLLISION_TYPES = {"BOX": "box", "SPHERE": "sphere", "CAPSULE": "capsule", "CYLINDER": "cylinder"}
+
+
+@dataclass(frozen=True)
+class SensorMount:
+    sensor: SensorDefinition
+    mount_name: str
+    position: tuple[float, float, float]
+    quaternion: tuple[float, float, float, float]
+    body_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -18,6 +34,7 @@ class RobotInstance:
     position: tuple[float, float, float]
     quaternion: tuple[float, float, float, float]
     qpos: dict[str, float]
+    sensors: tuple[SensorMount, ...] = ()
 
     @property
     def prefix(self) -> str:
@@ -35,6 +52,10 @@ class SceneMeshInstance:
     scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     dynamic: bool = False
     mass: float = 1.0
+    collision_shape: str = "MESH"
+    collision_enabled: bool = True
+    friction: float | None = None
+    restitution: float = 0.0
 
     @property
     def asset_name(self) -> str:
@@ -54,15 +75,94 @@ def _relative_model_path(source_path: str, output_path: Path) -> str:
         return source.as_posix()
 
 
-def _model_has_free_joint(source_path: Path) -> bool:
+def _model_has_free_joint(source_path: Path, visited: set[Path] | None = None) -> bool:
+    source_path = source_path.expanduser().resolve()
+    visited = visited if visited is not None else set()
+    if source_path in visited:
+        return False
+    visited.add(source_path)
     try:
         root = ElementTree.parse(source_path).getroot()
     except (ElementTree.ParseError, OSError):
         return False
-    return any(
+    if any(
         element.tag == "freejoint" or (element.tag == "joint" and element.get("type") == "free")
         for element in root.iter()
-    )
+    ):
+        return True
+    for include in root.iter("include"):
+        raw = include.get("file")
+        if raw and _model_has_free_joint(source_path.parent / raw, visited):
+            return True
+    return False
+
+
+def _sensorized_model_path(output_path: Path, instance: RobotInstance) -> Path:
+    return output_path.with_name(f"{output_path.stem}_assets") / f"{instance.prefix}sensorized.xml"
+
+
+def _write_sensorized_model(output_path: Path, instance: RobotInstance) -> Path:
+    """Add body-mounted sensors to a copy of the source MJCF."""
+    source_path = Path(instance.source_path).expanduser().resolve()
+    tree = ElementTree.parse(source_path)
+    root = tree.getroot()
+    body_names = {body.get("name") for body in root.iter("body")}
+    requested_names = {mount.body_name for mount in instance.sensors if mount.body_name}
+    if requested_names - body_names and root.find("include") is not None:
+        try:
+            import mujoco
+            root = ElementTree.fromstring(mujoco.MjSpec.from_file(str(source_path)).to_xml())
+        except (ImportError, AttributeError) as error:
+            raise ValueError("MuJoCo is required to mount sensors in included MJCF bodies") from error
+        tree = ElementTree.ElementTree(root)
+    compiler = root.find("compiler")
+    asset_dirs: dict[str, Path] = {}
+    if compiler is not None:
+        for key in ("assetdir", "meshdir", "texturedir"):
+            raw = compiler.get(key)
+            if raw:
+                resolved = Path(raw)
+                if not resolved.is_absolute():
+                    resolved = (source_path.parent / resolved).resolve()
+                compiler.set(key, str(resolved))
+                asset_dirs[key] = resolved
+    for include in root.iter("include"):
+        raw = include.get("file")
+        if raw and not Path(raw).is_absolute():
+            include.set("file", str((source_path.parent / raw).resolve()))
+    for asset in root.findall(".//asset/*[@file]"):
+        raw = asset.get("file")
+        if not raw or Path(raw).is_absolute():
+            continue
+        preferred = asset_dirs.get("meshdir") if asset.tag == "mesh" else asset_dirs.get("texturedir")
+        base = preferred or asset_dirs.get("assetdir") or source_path.parent
+        asset.set("file", str((base / raw).resolve()))
+
+    existing_sensor_section = root.find("sensor")
+    for mount in instance.sensors:
+        if not mount.body_name:
+            continue
+        target = next((body for body in root.iter("body") if body.get("name") == mount.body_name), None)
+        if target is None:
+            raise ValueError(f"Sensor mount body '{mount.body_name}' is not in {source_path}")
+        mount_body = ElementTree.SubElement(target, "body", {
+            "name": mount.mount_name,
+            "pos": _format_values(mount.position),
+            "quat": _format_values(mount.quaternion),
+        })
+        if mount.sensor.category == "lidar":
+            sites, rangefinders = compile_lidar(mount.sensor.lidar or LidarSensorSpec(), mount.mount_name)
+            mount_body.extend(sites)
+            if existing_sensor_section is None:
+                existing_sensor_section = ElementTree.SubElement(root, "sensor")
+            existing_sensor_section.extend(rangefinders)
+        elif mount.sensor.category == "depth_camera":
+            mount_body.append(compile_depth_camera(mount.sensor.camera or CameraSensorSpec(), mount.mount_name))
+    generated = _sensorized_model_path(output_path, instance)
+    generated.parent.mkdir(parents=True, exist_ok=True)
+    ElementTree.indent(tree, space="  ")
+    tree.write(generated, encoding="utf-8", xml_declaration=True)
+    return generated
 
 
 def build_world_xml(
@@ -114,6 +214,7 @@ def build_world_xml(
     )
 
     seen_ids: set[str] = set()
+    sensor_elements: list[ElementTree.Element] = []
     for instance in instances:
         if instance.instance_id in seen_ids:
             raise ValueError(f"Duplicate robot instance id: {instance.instance_id}")
@@ -122,14 +223,16 @@ def build_world_xml(
         if source.suffix.lower() != ".xml":
             raise ValueError(f"MuJoCo export requires an XML source: {source}")
         model_name = f"model_{instance.prefix[:-1]}"
+        model_source = _sensorized_model_path(output, instance) if any(mount.body_name for mount in instance.sensors) else source
         ElementTree.SubElement(
             asset,
             "model",
-            {"name": model_name, "file": _relative_model_path(instance.source_path, output)},
+            {"name": model_name, "file": _relative_model_path(str(model_source), output)},
         )
         attach_attributes = {"model": model_name, "prefix": instance.prefix}
         if _model_has_free_joint(source):
             ElementTree.SubElement(worldbody, "attach", attach_attributes)
+            sensor_parent = worldbody
         else:
             body = ElementTree.SubElement(
                 worldbody,
@@ -141,6 +244,27 @@ def build_world_xml(
                 },
             )
             ElementTree.SubElement(body, "attach", attach_attributes)
+            sensor_parent = body
+
+        for mount in instance.sensors:
+            if mount.body_name:
+                continue
+            mount_name = f"{instance.prefix}{mount.mount_name}"
+            mount_body = ElementTree.SubElement(
+                sensor_parent,
+                "body",
+                {
+                    "name": mount_name,
+                    "pos": _format_values(mount.position),
+                    "quat": _format_values(mount.quaternion),
+                },
+            )
+            if mount.sensor.category == "lidar":
+                sites, rangefinders = compile_lidar(mount.sensor.lidar or LidarSensorSpec(), mount_name)
+                mount_body.extend(sites)
+                sensor_elements.extend(rangefinders)
+            elif mount.sensor.category == "depth_camera":
+                mount_body.append(compile_depth_camera(mount.sensor.camera or CameraSensorSpec(), mount_name))
 
     seen_scene_ids: set[str] = set()
     for scene_mesh in scene_meshes:
@@ -150,19 +274,19 @@ def build_world_xml(
         source = Path(scene_mesh.source_path).expanduser()
         if source.suffix.lower() != ".obj":
             raise ValueError(f"MuJoCo scene export requires an OBJ mesh: {source}")
+        if scene_mesh.dynamic and not scene_mesh.collision_enabled:
+            raise ValueError(f"Dynamic scene mesh needs collision geometry: {scene_mesh.instance_id}")
+        if scene_mesh.dynamic and (not math.isfinite(scene_mesh.mass) or scene_mesh.mass <= 0):
+            raise ValueError(f"Dynamic scene mesh needs positive mass: {scene_mesh.instance_id}")
+        if scene_mesh.friction is not None and (not math.isfinite(scene_mesh.friction) or scene_mesh.friction < 0):
+            raise ValueError(f"Scene mesh friction must be nonnegative: {scene_mesh.instance_id}")
+        if not math.isfinite(scene_mesh.restitution) or not 0 <= scene_mesh.restitution <= 1:
+            raise ValueError(f"Scene mesh restitution must be between 0 and 1: {scene_mesh.instance_id}")
         mesh_name = scene_mesh.asset_name
         mesh_attributes = {"name": mesh_name, "file": _relative_model_path(scene_mesh.source_path, output)}
         if scene_mesh.scale != (1.0, 1.0, 1.0):
             mesh_attributes["scale"] = _format_values(scene_mesh.scale)
         ElementTree.SubElement(asset, "mesh", mesh_attributes)
-        geom_attributes = {
-            "name": mesh_name,
-            "type": "mesh",
-            "mesh": mesh_name,
-            "rgba": _format_values(scene_mesh.rgba),
-            "contype": "1",
-            "conaffinity": "1",
-        }
         body = ElementTree.SubElement(
             worldbody,
             "body",
@@ -174,9 +298,45 @@ def build_world_xml(
         )
         if scene_mesh.dynamic:
             ElementTree.SubElement(body, "freejoint", {"name": f"{mesh_name}_free"})
+        primitive_type = _PRIMITIVE_COLLISION_TYPES.get(scene_mesh.collision_shape)
+        if primitive_type and scene_mesh.collision_enabled:
+            ElementTree.SubElement(
+                body,
+                "geom",
+                {
+                    "name": f"{mesh_name}_visual",
+                    "type": "mesh",
+                    "mesh": mesh_name,
+                    "rgba": _format_values(scene_mesh.rgba),
+                    "contype": "0",
+                    "conaffinity": "0",
+                    "mass": "0",
+                },
+            )
+        geom_attributes = {
+            "name": mesh_name,
+            "type": primitive_type if primitive_type and scene_mesh.collision_enabled else "mesh",
+            "mesh": mesh_name,
+            "rgba": "0 0 0 0" if primitive_type and scene_mesh.collision_enabled else _format_values(scene_mesh.rgba),
+            "contype": "1" if scene_mesh.collision_enabled else "0",
+            "conaffinity": "1" if scene_mesh.collision_enabled else "0",
+        }
+        if scene_mesh.dynamic:
             geom_attributes["mass"] = f"{scene_mesh.mass:.17g}"
+        if scene_mesh.friction is not None and scene_mesh.collision_enabled:
+            geom_attributes["friction"] = _format_values((scene_mesh.friction, 0.005, 0.0001))
+        if scene_mesh.restitution > 0 and scene_mesh.collision_enabled:
+            # MuJoCo has no restitution geom attribute. Approximate Blender's bounce
+            # with an underdamped contact spring in MuJoCo's direct solref form.
+            bounce = min(scene_mesh.restitution, 0.999999)
+            log_bounce = math.log(bounce)
+            damping_ratio = -log_bounce / math.sqrt(math.pi**2 + log_bounce**2)
+            geom_attributes["solref"] = _format_values((-10000, -200 * damping_ratio))
         ElementTree.SubElement(body, "geom", geom_attributes)
 
+    if sensor_elements:
+        sensors = ElementTree.SubElement(root, "sensor")
+        sensors.extend(sensor_elements)
     return ElementTree.ElementTree(root)
 
 
@@ -186,6 +346,16 @@ def _manifest_value(instance: RobotInstance) -> dict[str, object]:
     value["quaternion"] = list(instance.quaternion)
     value["prefix"] = instance.prefix
     value["free_base"] = _model_has_free_joint(Path(instance.source_path))
+    value["sensors"] = [
+        {
+            "mount_name": mount.mount_name,
+            "position": list(mount.position),
+            "quaternion": list(mount.quaternion),
+            "body_name": mount.body_name,
+            "sensor": mount.sensor.to_dict(),
+        }
+        for mount in instance.sensors
+    ]
     return value
 
 
@@ -204,6 +374,7 @@ def _render_script(manifest_name: str, world_name: str) -> str:
 
 from pathlib import Path
 import json
+import sys
 import time
 
 import mujoco
@@ -274,6 +445,56 @@ for robot in manifest["robots"]:
             data.qpos[qpos_address + 3:qpos_address + 7] = orientation
 
 mujoco.mj_forward(model, data)
+
+for robot in manifest["robots"]:
+    for mount in robot.get("sensors", []):
+        mount_name = robot["prefix"] + mount["mount_name"]
+        definition = mount["sensor"]
+        if definition["category"] == "lidar":
+            spec = definition.get("lidar") or {{}}
+            channels = int(spec.get("channels", 1))
+            samples = int(spec.get("horizontal_samples", 360))
+            readings = []
+            for channel in range(channels):
+                row = []
+                for index in range(samples):
+                    suffix = f"{{channel:02d}}_{{index:02d}}" if channels > 1 else f"{{index:02d}}"
+                    name = f"{{mount_name}}_rf_{{suffix}}"
+                    sensor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, name)
+                    if sensor_id < 0:
+                        row.append(float("nan"))
+                    else:
+                        row.append(float(data.sensordata[int(model.sensor_adr[sensor_id])]))
+                readings.append(row)
+            print(f"{{mount_name}} lidar scan: {{readings[0] if channels == 1 else readings}}")
+        elif definition["category"] == "depth_camera":
+            camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, mount_name)
+            if camera_id < 0:
+                continue
+            spec = definition.get("camera") or {{}}
+            height = int(spec.get("resolution_height", 480))
+            width = int(spec.get("resolution_width", 640))
+            model.vis.global_.offheight = max(model.vis.global_.offheight, height)
+            model.vis.global_.offwidth = max(model.vis.global_.offwidth, width)
+            renderer = mujoco.Renderer(
+                model,
+                height=height,
+                width=width,
+            )
+            try:
+                renderer.enable_depth_rendering()
+                renderer.update_scene(data, camera=camera_id)
+                import numpy as np
+
+                depth_path = ROOT / f"{{mount_name}}_depth.npy"
+                np.save(depth_path, renderer.render())
+                print(f"{{mount_name}} depth frame saved to {{depth_path}}")
+            finally:
+                renderer.close()
+
+if "--sensors-only" in sys.argv:
+    raise SystemExit(0)
+
 with mujoco.viewer.launch_passive(model, data) as viewer:
     viewer.cam.lookat[:] = (0.0, 2.0, 1.2)
     viewer.cam.distance = 7.0
@@ -302,6 +523,9 @@ def write_world_export(
     output.parent.mkdir(parents=True, exist_ok=True)
     instance_list = list(instances)
     scene_mesh_list = list(scene_meshes)
+    for instance in instance_list:
+        if any(mount.body_name for mount in instance.sensors):
+            _write_sensorized_model(output, instance)
     world_tree = build_world_xml(instance_list, output, scene_mesh_list)
     ElementTree.indent(world_tree, space="  ")
     world_tree.write(output, encoding="utf-8", xml_declaration=True)

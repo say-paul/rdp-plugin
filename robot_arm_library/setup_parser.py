@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Iterable
 import xml.etree.ElementTree as ElementTree
 
+from .sensor_spec import SensorDefinition
+
 
 MODEL_KEYS = (
     "model_path",
@@ -257,6 +259,16 @@ def discover_robot_definitions(setup_path: str | Path) -> list[RobotDefinition]:
             records.extend(_parse_file(setup_file))
         except (OSError, ValueError, SyntaxError, ElementTree.ParseError):
             continue
+    if not records and registry_files:
+        if menagerie_root is not None:
+            return _parse_menagerie_directory(menagerie_root)
+        for setup_file in setup_files:
+            if setup_file in registry_files:
+                continue
+            try:
+                records.extend(_parse_file(setup_file))
+            except (OSError, ValueError, SyntaxError, ElementTree.ParseError):
+                continue
 
     unique: list[RobotDefinition] = []
     seen: set[tuple[str, str, str]] = set()
@@ -266,3 +278,27 @@ def discover_robot_definitions(setup_path: str | Path) -> list[RobotDefinition]:
             seen.add(key)
             unique.append(record)
     return unique
+
+
+def discover_sensor_definitions(setup_path: str | Path) -> list[SensorDefinition]:
+    """Read a sensor menagerie's root registry, returning no entries if absent."""
+    path = Path(setup_path).expanduser().resolve()
+    registry = path if path.is_file() and path.name == "registry.json" else path / "registry.json"
+    if not registry.is_file():
+        return []
+    try:
+        value = json.loads(registry.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    sensors = value.get("sensors") if isinstance(value, dict) else None
+    if not isinstance(sensors, dict):
+        return []
+    result: list[SensorDefinition] = []
+    for sensor_id, entry in sorted(sensors.items()):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            result.append(SensorDefinition.from_dict(str(sensor_id), entry, str(registry)))
+        except (ValueError, TypeError, KeyError):
+            continue
+    return result
