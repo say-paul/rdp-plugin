@@ -1126,7 +1126,10 @@ def _export_usd_scene(output: Path) -> Path:
 
 def _export_world_file(filepath: str) -> tuple[Path, Path, Path]:
     output = Path(bpy.path.abspath(filepath)).expanduser().resolve()
-    exported = write_world_export(output, _world_robot_instances(), _world_scene_meshes(output))
+    executable = bpy.context.scene.robot_mujoco_python.strip() or shutil.which("python") or "python"
+    exported = write_world_export(
+        output, _world_robot_instances(), _world_scene_meshes(output), python_executable=executable,
+    )
     _export_usd_scene(output)
     return exported
 

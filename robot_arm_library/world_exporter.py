@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import math
+import os
 import re
+import site
+import subprocess
+import sys
+import tempfile
 import xml.etree.ElementTree as ElementTree
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -15,6 +21,23 @@ from .sensor_spec import CameraSensorSpec, LidarSensorSpec, SensorDefinition
 
 
 _PRIMITIVE_COLLISION_TYPES = {"BOX": "box", "SPHERE": "sphere", "CAPSULE": "capsule", "CYLINDER": "cylinder"}
+
+
+class MuJoCoBackendUnavailable(RuntimeError):
+    """The current Python cannot provide the MuJoCo API required for export."""
+
+
+def _load_export_mujoco():
+    try:
+        return importlib.import_module("mujoco")
+    except ImportError:
+        user_site = site.getusersitepackages()
+        if user_site not in sys.path:
+            sys.path.insert(0, user_site)
+        try:
+            return importlib.import_module("mujoco")
+        except ImportError as error:
+            raise MuJoCoBackendUnavailable("MuJoCo cannot be imported in this Python environment") from error
 
 
 @dataclass(frozen=True)
@@ -122,11 +145,11 @@ def _write_sensorized_model(output_path: Path, instance: RobotInstance) -> Path:
     body_names = {body.get("name") for body in root.iter("body")}
     requested_names = {mount.body_name for mount in instance.sensors if mount.body_name}
     if requested_names - body_names and root.find("include") is not None:
-        try:
-            import mujoco
-            root = ElementTree.fromstring(mujoco.MjSpec.from_file(str(source_path)).to_xml())
-        except (ImportError, AttributeError) as error:
-            raise ValueError("MuJoCo is required to mount sensors in included MJCF bodies") from error
+        mujoco = _load_export_mujoco()
+        spec_type = getattr(mujoco, "MjSpec", None)
+        if spec_type is None:
+            raise MuJoCoBackendUnavailable("Sensor export for included bodies requires MuJoCo's MjSpec API")
+        root = ElementTree.fromstring(spec_type.from_file(str(source_path)).to_xml())
         tree = ElementTree.ElementTree(root)
     compiler = root.find("compiler")
     asset_dirs: dict[str, Path] = {}
@@ -486,13 +509,10 @@ def _add_root_sensors(spec, instance: RobotInstance, mujoco):
 def _build_mounted_world(
     instances: list[RobotInstance], output: Path, scene_meshes: list[SceneMeshInstance],
 ) -> ElementTree.ElementTree:
-    try:
-        import mujoco
-    except ImportError as error:
-        raise ValueError("MuJoCo must be available in Blender to export rigid mounts") from error
+    mujoco = _load_export_mujoco()
     spec_type = getattr(mujoco, "MjSpec", None)
     if spec_type is None or not hasattr(spec_type, "attach"):
-        raise ValueError("Rigid mounts require MuJoCo's MjSpec.attach API; upgrade MuJoCo")
+        raise MuJoCoBackendUnavailable("Rigid mounts require MuJoCo's MjSpec.attach API; upgrade MuJoCo")
     order = _mount_order(instances, scene_meshes)
     root = build_world_xml([], output).getroot()
     if root is None:
@@ -744,12 +764,12 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
 '''
 
 
-def write_world_export(
+def _write_world_export_local(
     output_path: str | Path,
     instances: Iterable[RobotInstance],
     scene_meshes: Iterable[SceneMeshInstance] = (),
 ) -> tuple[Path, Path, Path]:
-    """Write a MuJoCo world, robot pose data, and a runnable physics viewer script."""
+    """Write a world using the current interpreter's available MuJoCo backend."""
     output = Path(output_path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     instance_list = list(instances)
@@ -778,3 +798,60 @@ def write_world_export(
     render_path = output.with_name("render_world.py")
     render_path.write_text(_render_script(manifest_path.name, output.name), encoding="utf-8")
     return output, manifest_path, render_path
+
+
+def _write_world_export_external(
+    output: Path, instances: list[RobotInstance], scene_meshes: list[SceneMeshInstance], executable: str,
+) -> tuple[Path, Path, Path]:
+    robots = [asdict(instance) for instance in instances]
+    meshes = [asdict(mesh) for mesh in scene_meshes]
+    for value in (*robots, *meshes):
+        value["source_path"] = str(Path(value["source_path"]).expanduser().resolve())
+    payload = {"version": 1, "output_path": str(output), "robots": robots, "scene_meshes": meshes}
+    env = os.environ.copy()
+    package_parent = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (package_parent, env.get("PYTHONPATH", ""))))
+    env.pop("PYTHONHOME", None)
+    guidance = f"Check the Python executable selected in Sim > MuJoCo > Python: {executable}"
+    with tempfile.TemporaryDirectory(prefix="caryam-export-") as directory:
+        request = Path(directory) / "request.json"
+        request.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            result = subprocess.run(
+                [executable, "-m", "robot_arm_library.world_export_worker", str(request)],
+                cwd=str(output.parent), env=env, capture_output=True,
+                encoding="utf-8", errors="replace", timeout=120, check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"MuJoCo export timed out after 120 seconds. {guidance}") from error
+        except OSError as error:
+            raise RuntimeError(f"Could not start MuJoCo export. {guidance}\n{error}") from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-4000:]
+        raise RuntimeError(
+            f"MuJoCo export failed. {guidance}\n"
+            f"That interpreter must have a compatible MuJoCo package installed.\n{detail}"
+        )
+    paths = output, output.with_suffix(".json"), output.with_name("render_world.py")
+    if not all(path.is_file() for path in paths):
+        raise RuntimeError(f"MuJoCo export did not produce all expected files. {guidance}")
+    return paths
+
+
+def write_world_export(
+    output_path: str | Path,
+    instances: Iterable[RobotInstance],
+    scene_meshes: Iterable[SceneMeshInstance] = (),
+    *,
+    python_executable: str | None = None,
+) -> tuple[Path, Path, Path]:
+    """Export locally, or use the selected Python if its MuJoCo backend is needed."""
+    output = Path(output_path).expanduser().resolve()
+    instance_list = list(instances)
+    scene_mesh_list = list(scene_meshes)
+    try:
+        return _write_world_export_local(output, instance_list, scene_mesh_list)
+    except MuJoCoBackendUnavailable:
+        if python_executable is None:
+            raise
+        return _write_world_export_external(output, instance_list, scene_mesh_list, python_executable)
