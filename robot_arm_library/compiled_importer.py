@@ -214,6 +214,7 @@ def import_compiled_mjcf(
             joint_object.show_in_front = True
             joint_object.hide_render = True
             joint_object["mujoco_joint_id"] = joint_id
+            joint_object["mujoco_joint_name"] = joint_name
             joint_object["joint_type"] = joint_types.get(joint_type, "unknown")
             joint_object["range"] = tuple(float(value) for value in model.jnt_range[joint_id])
             collection.objects.link(joint_object)
@@ -258,6 +259,7 @@ def import_compiled_mjcf(
         body_object.empty_display_type = "PLAIN_AXES"
         body_object.empty_display_size = 0.04
         body_object["mujoco_body_id"] = body_id
+        body_object["mujoco_body_name"] = body_name
         collection.objects.link(body_object)
         body_object.parent = parent
         body_object.matrix_world = root.matrix_world @ _pose_matrix(data.xpos[body_id], data.xmat[body_id])

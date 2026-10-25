@@ -6,7 +6,7 @@ import json
 import math
 import re
 import xml.etree.ElementTree as ElementTree
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -27,6 +27,15 @@ class SensorMount:
 
 
 @dataclass(frozen=True)
+class RobotMount:
+    target_kind: str
+    target_instance_id: str
+    target_body_name: str = ""
+    position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    quaternion: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
 class RobotInstance:
     instance_id: str
     robot_id: str
@@ -35,6 +44,7 @@ class RobotInstance:
     quaternion: tuple[float, float, float, float]
     qpos: dict[str, float]
     sensors: tuple[SensorMount, ...] = ()
+    mount: RobotMount | None = None
 
     @property
     def prefix(self) -> str:
@@ -44,6 +54,8 @@ class RobotInstance:
 
 @dataclass(frozen=True)
 class SceneMeshInstance:
+    """Scene geometry with asset-only scale and an optional rigid root-body mount."""
+
     instance_id: str
     source_path: str
     rgba: tuple[float, float, float, float]
@@ -56,6 +68,7 @@ class SceneMeshInstance:
     collision_enabled: bool = True
     friction: float | None = None
     restitution: float = 0.0
+    mount: RobotMount | None = None
 
     @property
     def asset_name(self) -> str:
@@ -172,6 +185,10 @@ def build_world_xml(
 ) -> ElementTree.ElementTree:
     """Build a MuJoCo 3.2+ world using ``asset/model`` and ``attach``."""
     output = Path(output_path).expanduser().resolve()
+    instance_list = list(instances)
+    scene_mesh_list = list(scene_meshes)
+    if any(instance.mount is not None for instance in instance_list) or any(mesh.mount is not None for mesh in scene_mesh_list):
+        return _build_mounted_world(instance_list, output, scene_mesh_list)
     root = ElementTree.Element("mujoco", {"model": "caryam_world"})
     ElementTree.SubElement(root, "compiler", {"autolimits": "true"})
     ElementTree.SubElement(root, "option", {"timestep": "0.002", "gravity": "0 0 -9.81"})
@@ -215,7 +232,7 @@ def build_world_xml(
 
     seen_ids: set[str] = set()
     sensor_elements: list[ElementTree.Element] = []
-    for instance in instances:
+    for instance in instance_list:
         if instance.instance_id in seen_ids:
             raise ValueError(f"Duplicate robot instance id: {instance.instance_id}")
         seen_ids.add(instance.instance_id)
@@ -267,7 +284,7 @@ def build_world_xml(
                 mount_body.append(compile_depth_camera(mount.sensor.camera or CameraSensorSpec(), mount_name))
 
     seen_scene_ids: set[str] = set()
-    for scene_mesh in scene_meshes:
+    for scene_mesh in scene_mesh_list:
         if scene_mesh.instance_id in seen_scene_ids:
             raise ValueError(f"Duplicate scene mesh id: {scene_mesh.instance_id}")
         seen_scene_ids.add(scene_mesh.instance_id)
@@ -340,12 +357,220 @@ def build_world_xml(
     return ElementTree.ElementTree(root)
 
 
+def _mount_order(
+    instances: list[RobotInstance], scene_meshes: list[SceneMeshInstance],
+) -> list[RobotInstance | SceneMeshInstance]:
+    if len({instance.instance_id for instance in instances}) != len(instances):
+        raise ValueError("Duplicate robot instance id")
+    if len({instance.prefix for instance in instances}) != len(instances):
+        raise ValueError("Robot instance names produce duplicate MuJoCo prefixes")
+    if len({mesh.instance_id for mesh in scene_meshes}) != len(scene_meshes):
+        raise ValueError("Duplicate scene mesh id")
+    if len({mesh.asset_name for mesh in scene_meshes}) != len(scene_meshes):
+        raise ValueError("Scene mesh names produce duplicate MuJoCo names")
+    nodes: dict[tuple[str, str], RobotInstance | SceneMeshInstance] = {
+        **{("robot", instance.instance_id): instance for instance in instances},
+        **{("scene", mesh.instance_id): mesh for mesh in scene_meshes},
+    }
+    order: list[RobotInstance | SceneMeshInstance] = []
+    visiting: set[tuple[str, str]] = set()
+    visited: set[tuple[str, str]] = set()
+
+    def visit(key: tuple[str, str]) -> None:
+        if key in visiting:
+            raise ValueError("Rigid mounts contain a cycle")
+        if key in visited:
+            return
+        visiting.add(key)
+        instance = nodes[key]
+        mount = instance.mount
+        if mount is not None:
+            if not all(math.isfinite(value) for value in (*mount.position, *mount.quaternion)):
+                raise ValueError("Mount poses must be finite")
+            if len(mount.position) != 3 or len(mount.quaternion) != 4 or sum(value * value for value in mount.quaternion) < 1e-12:
+                raise ValueError("Mount poses require a position and nonzero quaternion")
+            if mount.target_kind not in {"robot", "scene"}:
+                raise ValueError(f"Unsupported mount target kind: {mount.target_kind}")
+            target_key = (mount.target_kind, mount.target_instance_id)
+            if target_key not in nodes:
+                raise ValueError(f"Missing {mount.target_kind} mount target: {mount.target_instance_id}")
+            if mount.target_kind == "robot" and not mount.target_body_name:
+                raise ValueError("A robot mount requires a target MJCF body name")
+            visit(target_key)
+        visiting.remove(key)
+        visited.add(key)
+        order.append(instance)
+
+    for key in nodes:
+        visit(key)
+    return order
+
+
+def _load_mount_spec(source: Path, mujoco):
+    spec = mujoco.MjSpec.from_file(str(source))
+    for kind, directory in (
+        ("meshes", spec.compiler.meshdir), ("textures", spec.compiler.texturedir),
+        ("hfields", ""), ("skins", ""),
+    ):
+        for asset in getattr(spec, kind):
+            if asset.file:
+                asset.file = str((source.parent / directory / asset.file).resolve())
+            if kind == "textures":
+                asset.cubefiles = [
+                    str((source.parent / directory / name).resolve()) if name else "" for name in asset.cubefiles
+                ]
+    return spec
+
+
+def _mounted_spec(instance: RobotInstance, source: Path, mujoco):
+    spec = _load_mount_spec(source, mujoco)
+    bases = list(spec.worldbody.bodies)
+    if len(bases) != 1:
+        raise ValueError(f"Mounted robot '{instance.instance_id}' must have exactly one base body")
+    base = bases[0]
+    base_joints = list(base.joints)
+    if any(joint.type != mujoco.mjtJoint.mjJNT_FREE for joint in base_joints):
+        raise ValueError(f"Mounted robot '{instance.instance_id}' base must be fixed or free, not articulated")
+    if not base_joints:
+        return spec
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    home_key = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    if home_key >= 0:
+        mujoco.mj_resetDataKeyframe(model, data, home_key)
+    mujoco.mj_forward(model, data)
+    base_id = 1
+    base.pos = data.xpos[base_id].tolist()
+    base.quat = data.xquat[base_id].tolist()
+    qpos_indices: set[int] = set()
+    qvel_indices: set[int] = set()
+    for joint_id in range(int(model.body_jntadr[base_id]), int(model.body_jntadr[base_id] + model.body_jntnum[base_id])):
+        qpos_indices.update(range(int(model.jnt_qposadr[joint_id]), int(model.jnt_qposadr[joint_id]) + 7))
+        qvel_indices.update(range(int(model.jnt_dofadr[joint_id]), int(model.jnt_dofadr[joint_id]) + 6))
+    for index, key in enumerate(spec.keys):
+        key.qpos = [float(value) for address, value in enumerate(model.key_qpos[index]) if address not in qpos_indices]
+        key.qvel = [float(value) for address, value in enumerate(model.key_qvel[index]) if address not in qvel_indices]
+    for joint in base_joints:
+        spec.delete(joint)
+    spec.compile()
+    return spec
+
+
+def _add_root_sensors(spec, instance: RobotInstance, mujoco):
+    root = ElementTree.fromstring(spec.to_xml())
+    size = root.find("size")
+    if size is not None:
+        size.attrib.pop("nkey", None)
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise ValueError("The robot model has no worldbody for its root sensors")
+    for mount in instance.sensors:
+        if mount.body_name:
+            continue
+        body = ElementTree.SubElement(worldbody, "body", {
+            "name": mount.mount_name, "pos": _format_values(mount.position),
+            "quat": _format_values(mount.quaternion),
+        })
+        if mount.sensor.category == "lidar":
+            sites, sensors = compile_lidar(mount.sensor.lidar or LidarSensorSpec(), mount.mount_name)
+            body.extend(sites)
+            section = root.find("sensor")
+            if section is None:
+                section = ElementTree.SubElement(root, "sensor")
+            section.extend(sensors)
+        elif mount.sensor.category == "depth_camera":
+            body.append(compile_depth_camera(mount.sensor.camera or CameraSensorSpec(), mount.mount_name))
+    return mujoco.MjSpec.from_string(ElementTree.tostring(root, encoding="unicode"))
+
+
+def _build_mounted_world(
+    instances: list[RobotInstance], output: Path, scene_meshes: list[SceneMeshInstance],
+) -> ElementTree.ElementTree:
+    try:
+        import mujoco
+    except ImportError as error:
+        raise ValueError("MuJoCo must be available in Blender to export rigid mounts") from error
+    spec_type = getattr(mujoco, "MjSpec", None)
+    if spec_type is None or not hasattr(spec_type, "attach"):
+        raise ValueError("Rigid mounts require MuJoCo's MjSpec.attach API; upgrade MuJoCo")
+    order = _mount_order(instances, scene_meshes)
+    root = build_world_xml([], output).getroot()
+    if root is None:
+        raise ValueError("The exported MuJoCo world has no root")
+    world = spec_type.from_string(ElementTree.tostring(root, encoding="unicode"))
+    robots = {instance.instance_id: instance for instance in instances}
+    scenes = {mesh.instance_id: mesh for mesh in scene_meshes}
+    for instance in order:
+        mount = instance.mount
+        if isinstance(instance, SceneMeshInstance):
+            if mount is not None and (not math.isfinite(instance.mass) or instance.mass <= 0):
+                raise ValueError(f"Mounted scene mesh needs positive mass: {instance.instance_id}")
+            scene_root = build_world_xml([], output, [replace(instance, mount=None)]).getroot()
+            assert scene_root is not None
+            asset = scene_root.find("asset")
+            worldbody = scene_root.find("worldbody")
+            assert asset is not None and worldbody is not None
+            for element in list(asset):
+                if element.tag == "mesh":
+                    element.set("file", str((output.parent / element.get("file", "")).resolve()))
+                else:
+                    asset.remove(element)
+            for element in list(worldbody):
+                if element.tag != "body":
+                    worldbody.remove(element)
+                elif mount is not None:
+                    element.set("pos", "0 0 0")
+                    element.set("quat", "1 0 0 0")
+                    for joint in element.findall("freejoint"):
+                        element.remove(joint)
+                    geom = element.find(f"geom[@name='{instance.asset_name}']")
+                    assert geom is not None
+                    geom.set("mass", f"{instance.mass:.17g}")
+            child = spec_type.from_string(ElementTree.tostring(scene_root, encoding="unicode"))
+            prefix = ""
+            frame = world.worldbody.add_frame() if mount is None else None
+        else:
+            source = Path(instance.source_path).expanduser().resolve()
+            if source.suffix.lower() != ".xml":
+                raise ValueError(f"MuJoCo export requires an XML source: {source}")
+            if any(sensor.body_name for sensor in instance.sensors):
+                source = _sensorized_model_path(output, instance)
+            child = _load_mount_spec(source, mujoco) if mount is None else _mounted_spec(instance, source, mujoco)
+            if any(not sensor.body_name for sensor in instance.sensors):
+                child = _add_root_sensors(child, instance, mujoco)
+            prefix = instance.prefix
+            frame = None
+            if mount is None:
+                if _model_has_free_joint(source):
+                    frame = world.worldbody.add_frame()
+                else:
+                    frame = world.worldbody.add_frame(pos=instance.position, quat=instance.quaternion)
+        if mount is not None:
+            if mount.target_kind == "scene":
+                target_name = scenes[mount.target_instance_id].asset_name
+            else:
+                target_name = robots[mount.target_instance_id].prefix + mount.target_body_name
+            target = world.body(target_name)
+            if target is None:
+                raise ValueError(f"Missing MuJoCo mount body: {target_name}")
+            frame = target.add_frame(pos=mount.position, quat=mount.quaternion)
+        world.attach(child, prefix=prefix, frame=frame)
+    world.compile()
+    root = ElementTree.fromstring(world.to_xml())
+    # Unprefixed specs serialize empty unnamed nested defaults, which MJCF cannot reload.
+    for section in root.iter("default"):
+        for nested in section.findall("default"):
+            if not nested.attrib and len(nested) == 0:
+                section.remove(nested)
+    return ElementTree.ElementTree(root)
+
+
 def _manifest_value(instance: RobotInstance) -> dict[str, object]:
     value = asdict(instance)
     value["position"] = list(instance.position)
     value["quaternion"] = list(instance.quaternion)
     value["prefix"] = instance.prefix
-    value["free_base"] = _model_has_free_joint(Path(instance.source_path))
+    value["free_base"] = instance.mount is None and _model_has_free_joint(Path(instance.source_path))
     value["sensors"] = [
         {
             "mount_name": mount.mount_name,
@@ -439,9 +664,15 @@ for robot in manifest["robots"]:
         )
         if free_joint >= 0:
             qpos_address = int(model.jnt_qposadr[free_joint])
+            rotation = robot["quaternion"]
+            inverse_rotation = (rotation[0], -rotation[1], -rotation[2], -rotation[3])
+            local_position = (0.0, *data.qpos[qpos_address:qpos_address + 3])
+            rotated_position = multiply_quaternions(
+                multiply_quaternions(rotation, local_position), inverse_rotation,
+            )
             for index, value in enumerate(robot["position"]):
-                data.qpos[qpos_address + index] += float(value)
-            orientation = multiply_quaternions(robot["quaternion"], data.qpos[qpos_address + 3:qpos_address + 7])
+                data.qpos[qpos_address + index] = rotated_position[index + 1] + float(value)
+            orientation = multiply_quaternions(rotation, data.qpos[qpos_address + 3:qpos_address + 7])
             data.qpos[qpos_address + 3:qpos_address + 7] = orientation
 
 mujoco.mj_forward(model, data)

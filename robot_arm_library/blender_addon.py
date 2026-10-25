@@ -22,6 +22,7 @@ from .asset_sources import AssetSource, discover_from_sources
 from .behavior_graph import BehaviorGraph, BehaviorLink, BehaviorNode, PortSpec
 from .container_builder import DEFAULT_BASE_IMAGE
 from .port_catalog import catalog_node_template
+from . import mounting
 from .setup_parser import discover_sensor_definitions
 from .world_exporter import RobotInstance, SceneMeshInstance, SensorMount, write_world_export
 
@@ -960,7 +961,7 @@ def _world_robot_instances() -> list[RobotInstance]:
         if not source_path or Path(source_path).suffix.lower() != ".xml":
             continue
         qpos = {
-            joint.name.removeprefix("Joint: "): float(joint["qpos"])
+            str(joint.get("mujoco_joint_name", joint.name.removeprefix("Joint: "))): float(joint["qpos"])
             for joint in _joint_controls(root)
         }
         position = tuple(float(value) for value in root.matrix_world.translation)
@@ -974,6 +975,7 @@ def _world_robot_instances() -> list[RobotInstance]:
                 quaternion=quaternion,
                 qpos=qpos,
                 sensors=tuple(_sensor_mounts(root)),
+                mount=mounting.export_mount(root),
             )
         )
     return instances
@@ -984,10 +986,7 @@ def _sensor_mounts(root: bpy.types.Object) -> list[SensorMount]:
     for obj in sorted(bpy.context.scene.objects, key=lambda item: item.name):
         if not obj.get("sensor_id"):
             continue
-        ancestor = obj
-        while ancestor.parent is not None and ancestor is not root:
-            ancestor = ancestor.parent
-        if ancestor is not root:
+        if _selected_robot_root(obj) is not root:
             continue
         source_path = str(obj.get("sensor_source_path", ""))
         payload = str(obj.get("sensor_definition_json", ""))
@@ -1003,9 +1002,12 @@ def _sensor_mounts(root: bpy.types.Object) -> list[SensorMount]:
         except (OSError, ValueError, StopIteration, TypeError):
             continue
         parent_body = obj.parent
-        while parent_body is not None and parent_body is not root and not parent_body.name.startswith("Body: "):
+        while (
+            parent_body is not None and parent_body is not root
+            and "mujoco_body_id" not in parent_body and not parent_body.name.startswith("Body: ")
+        ):
             parent_body = parent_body.parent
-        body_name = parent_body.name.removeprefix("Body: ") if parent_body is not None and parent_body is not root else ""
+        body_name = str(parent_body.get("mujoco_body_name", parent_body.name.removeprefix("Body: "))) if parent_body is not None and parent_body is not root else ""
         frame = parent_body if parent_body is not None else root
         local_matrix = frame.matrix_world.inverted() @ obj.matrix_world
         mounts.append(SensorMount(
@@ -1023,6 +1025,8 @@ def _is_robot_library_object(obj: bpy.types.Object) -> bool:
     while ancestor is not None:
         if ancestor.get("robot_id"):
             return True
+        if ancestor.type == "MESH" and ancestor.caryam_mount.enabled:
+            return False
         ancestor = ancestor.parent
     return False
 
@@ -1100,6 +1104,7 @@ def _world_scene_meshes(output: Path) -> list[SceneMeshInstance]:
                 collision_enabled=rigid_body is None or rigid_body.enabled or bool(obj.get("mujoco_dynamic", False)),
                 friction=float(rigid_body.friction) if rigid_body is not None else None,
                 restitution=float(rigid_body.restitution) if rigid_body is not None else 0.0,
+                mount=mounting.export_mount(obj),
             )
         )
     return scene_meshes
@@ -1198,10 +1203,7 @@ def _joint_controls(root: bpy.types.Object) -> list[bpy.types.Object]:
     for obj in bpy.data.objects:
         if "qpos" not in obj:
             continue
-        ancestor = obj
-        while ancestor.parent is not None and ancestor != root:
-            ancestor = ancestor.parent
-        if ancestor == root:
+        if _selected_robot_root(obj) == root:
             controls.append(obj)
     return sorted(controls, key=lambda obj: int(obj.get("mujoco_joint_id", 0)))
 
@@ -2490,10 +2492,12 @@ CLASSES = (
     ROBOT_PT_rcs_control,
     ROBOT_PT_robot_build,
     ROBOT_PT_behavior_editor,
+    *mounting.MOUNT_CLASSES,
 )
 
 
 def _remove_scene_properties() -> None:
+    mounting.unregister_properties()
     for name in (
         "robot_library",
         "robot_library_index",
@@ -2508,6 +2512,8 @@ def _remove_scene_properties() -> None:
         "robot_library_preview_mode",
         "robot_library_mesh_detail",
         "robot_library_control_root",
+        "robot_mount_distance",
+        "robot_magnet_alignment",
         "robot_mujoco_python",
         "robot_core_bridge_url",
         "robot_core_host",
@@ -2572,6 +2578,20 @@ def register() -> None:
         default=1.0, min=0.01, max=1.0,
     )
     bpy.types.Scene.robot_library_control_root = PointerProperty(name="Controlled Robot", type=bpy.types.Object)
+    mounting.register_properties()
+    bpy.types.Scene.robot_mount_distance = FloatProperty(
+        name="Snap Distance", description="Maximum distance from the robot base to a surface or mount point",
+        default=0.1, min=0.001, subtype="DISTANCE", unit="LENGTH",
+    )
+    bpy.types.Scene.robot_magnet_alignment = EnumProperty(
+        name="Magnetic Alignment",
+        items=(
+            ("OPPOSE", "Face to Face", "Mate outward-facing point normals without overlapping the surfaces"),
+            ("MATCH", "Match Frames", "Match both points' axes"),
+            ("POSITION", "Position Only", "Keep the moving object's orientation"),
+        ),
+        default="OPPOSE",
+    )
     bpy.types.Scene.robot_mujoco_python = StringProperty(name="MuJoCo Python", default="python")
     bpy.types.Scene.robot_core_bridge_url = StringProperty(name="Core Bridge", default="http://127.0.0.1:8765")
     bpy.types.Scene.robot_core_host = StringProperty(name="Core Host", default="localhost")
