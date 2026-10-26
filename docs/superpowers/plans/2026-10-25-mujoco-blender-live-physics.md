@@ -1,8 +1,8 @@
 # MuJoCo-driven live physics in Blender
 
-**Status:** Initial live-viewport integration implemented and validated. Physics integration is grouped in [`robot_arm_library/physics/`](../../../robot_arm_library/physics/) as `runtime.py`, `protocol.py`, `worker.py`, `client.py`, and `blender.py`, replacing the originally proposed flat module names below. Deliver physics-driven joint targets in a separate commit on top.
+**Status:** Implemented and validated in two stages: initial live-viewport integration (`4af4835`), followed by physics-driven joint targets in a separate commit. Physics integration is grouped in [`robot_arm_library/physics/`](../../../robot_arm_library/physics/) as `runtime.py`, `protocol.py`, `worker.py`, `client.py`, `blender.py`, and `control.py`.
 
-Validation: shared initialization/reset and standalone-renderer tests; real external worker/protocol/lifecycle tests; headless Blender falling/contact, articulated/floating/duplicate robots, nested mixed mounts, scaled parents, restoration/failure/save/scene-switch checks; existing export/Sticky Move/Magnetic Move/sensor/graph regressions; and graphical Blender scene-panel/timer playback smoke test. Blender-side MuJoCo was deliberately blocked during saved-scene playback tests. Joint sliders are initially disabled while live physics runs; live target control follows separately.
+Validation: shared initialization/reset and standalone-renderer tests; real external worker/protocol/lifecycle tests; headless Blender falling/contact, articulated/floating/duplicate robots, nested mixed mounts, scaled parents, restoration/failure/save/scene-switch checks; existing export/Sticky Move/Magnetic Move/sensor/graph regressions; and graphical Blender scene-panel/timer playback smoke test. Blender-side MuJoCo was deliberately blocked during saved-scene playback tests. The separate joint-control stage adds implicit PD servos, native/configured effort limits, contact-blocked targets, paused edits/reset/restore, duplicate-instance mapping, and graphical target/actual readout checks.
 
 ## Goal and confirmed behavior
 
@@ -15,7 +15,7 @@ Confirmed for the first release:
 - Add live viewport **Start, Pause, Resume, Reset, Stop** controls. Do not bake animation or drive Blender's timeline.
 - **Stop restores the original authoring pose**, including after startup failure or a worker crash.
 - Keep the existing **Play** external-viewer workflow and **Export** behavior. Add a clearly separate **Live in Blender** section rather than silently changing Play.
-- Simulate the same supported robots, meshes, contacts, and rigid mounts as the existing world exporter. Import/authoring limitations remain unchanged. This is a physics preview, not a new controller: actuator inputs retain the current viewer's initialization behavior, and joint sliders do not command a running simulation.
+- Simulate the same supported robots, meshes, contacts, and rigid mounts as the existing world exporter. Import/authoring limitations remain unchanged. The initial integration preserves the viewer's actuator initialization and disables live joint editing. The separately delivered follow-up enables explicit, limited-effort hinge/slide targets during playback without teleporting simulated positions; it is not a hardware/ROS controller.
 
 ## Blender UI: scene-wide engine, per-object properties
 
@@ -80,7 +80,7 @@ Physics runs at the model's fixed timestep. Publish viewport snapshots at a boun
 
 ### 1. Share and verify simulation initialization
 
-**Files:** new [simulation_runtime.py](../../../robot_arm_library/simulation_runtime.py); update [world_exporter.py](../../../robot_arm_library/world_exporter.py) and [world_export_worker.py](../../../robot_arm_library/world_export_worker.py).
+**Files:** [physics/runtime.py](../../../robot_arm_library/physics/runtime.py); update [world_exporter.py](../../../robot_arm_library/world_exporter.py) and [world_export_worker.py](../../../robot_arm_library/world_export_worker.py).
 
 - Introduce optional scene-level world options for gravity and timestep, with the current defaults when omitted. Pass them through composition, manifest/export requests, and the external export worker. Preserve existing positional export calls and version-1 manifest compatibility; viewport update rate remains a client/stream option, not the MuJoCo timestep.
 - Extract model initialization from the renderer template into a Blender-independent runtime helper: home state, per-instance qpos, floating-base placement, and `mj_forward`.
@@ -92,7 +92,7 @@ Physics runs at the model's fixed timestep. Publish viewport snapshots at a boun
 
 ### 2. Define session bindings and message contracts
 
-**Files:** new [simulation_protocol.py](../../../robot_arm_library/simulation_protocol.py); export/binding integration in [blender_addon.py](../../../robot_arm_library/blender_addon.py), with additive manifest changes only if needed.
+**Files:** [physics/protocol.py](../../../robot_arm_library/physics/protocol.py); export/binding integration in [blender_addon.py](../../../robot_arm_library/blender_addon.py), with additive manifest changes only if needed.
 
 - Build a frozen session map from the exact objects collected for export, not from a second enumeration with potentially different visibility or ordering.
 - Resolve robot bodies by instance prefix plus original MuJoCo body name; resolve scene bodies by their exported asset/body name. Never reuse source-model numeric IDs against the composed model.
@@ -105,7 +105,7 @@ Physics runs at the model's fixed timestep. Publish viewport snapshots at a boun
 
 ### 3. Implement the persistent external runtime and client
 
-**Files:** new [simulation_worker.py](../../../robot_arm_library/simulation_worker.py) and [simulation_client.py](../../../robot_arm_library/simulation_client.py).
+**Files:** [physics/worker.py](../../../robot_arm_library/physics/worker.py) and [physics/client.py](../../../robot_arm_library/physics/client.py).
 
 - Start the worker using the existing selected interpreter and the add-on package path, following the export worker's environment handling. Keep native MuJoCo imports out of Blender-only modules.
 - Export live-session artifacts into a session-owned temporary directory, not over the user's saved world files. Reuse export collection/composition without requiring an unrelated USD export for viewport playback.
@@ -119,7 +119,7 @@ Physics runs at the model's fixed timestep. Publish viewport snapshots at a boun
 
 ### 4. Apply poses without damaging the authoring scene
 
-**Files:** new [blender_simulation.py](../../../robot_arm_library/blender_simulation.py); narrowly scoped integration with [compiled_importer.py](../../../robot_arm_library/compiled_importer.py) and [mounting.py](../../../robot_arm_library/mounting.py) if required.
+**Files:** [physics/blender.py](../../../robot_arm_library/physics/blender.py); narrowly scoped integration with [compiled_importer.py](../../../robot_arm_library/compiled_importer.py) and [mounting.py](../../../robot_arm_library/mounting.py) if required.
 
 - Capture the original authoring state before any mutation: transforms, parent inverses, affected qpos properties, relevant driver/constraint mute states, rigid-body participation, and current frame.
 - After successful export/binding validation, suspend competing Blender physics, animation, and pose drivers only where necessary for participating objects. Preserve the original states for restoration.
@@ -150,7 +150,7 @@ Physics runs at the model's fixed timestep. Publish viewport snapshots at a boun
 
 ### 6. Validate, document, and package
 
-**New focused tests:** [test_simulation_runtime.py](../../../tests/test_simulation_runtime.py), [test_simulation_protocol.py](../../../tests/test_simulation_protocol.py), [test_simulation_client.py](../../../tests/test_simulation_client.py), and [blender_live_physics_test.py](../../../tests/blender_live_physics_test.py).
+**Focused tests:** [test_simulation_runtime.py](../../../tests/test_simulation_runtime.py), [test_simulation_worker.py](../../../tests/test_simulation_worker.py) (including protocol/client checks), [test_simulation_control.py](../../../tests/test_simulation_control.py), [blender_live_physics_test.py](../../../tests/blender_live_physics_test.py), [blender_live_joint_control_test.py](../../../tests/blender_live_joint_control_test.py), and [blender_live_physics_gui_test.py](../../../tests/blender_live_physics_gui_test.py).
 
 Acceptance scenarios:
 
@@ -181,7 +181,7 @@ Deliver first a falling-cube vertical slice, then articulated robots, then mixed
 ## Explicitly deferred
 
 - Timeline baking, animation export, and keeping the final simulated pose.
-- Live geometry/physics editing, animated kinematic inputs, interactive dragging forces, and actuator authoring/control UI.
+- Live geometry/physics editing, animated kinematic inputs, interactive dragging forces, and general actuator authoring. The separately implemented hinge/slide target UI is limited to temporary physics-preview servos, not arbitrary coupled transmissions.
 - ROS2/ros2_control, data-graph actuation, continuous sensor streaming, and edge deployment.
 - URDF conversion, new articulated-robot construction, automatic concave decomposition, and replacing Blender's internal solver globally.
 

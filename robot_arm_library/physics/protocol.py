@@ -8,7 +8,15 @@ import math
 VERSION = 1
 MAX_MESSAGE = 8 * 1024 * 1024
 MAX_BODIES = 20000
-COMMANDS = {"start", "pause", "resume", "reset", "stop"}
+COMMANDS = {"start", "pause", "resume", "reset", "stop", "targets"}
+
+
+def _joint_values(values):
+    if not isinstance(values, dict) or len(values) > MAX_BODIES or any(
+        not isinstance(name, str) or not name or not isinstance(value, (int, float)) or not math.isfinite(value)
+        for name, value in values.items()
+    ):
+        raise ValueError("Invalid joint target/state values")
 
 
 def encode(message):
@@ -40,13 +48,31 @@ def decode(raw, session):
                 raise ValueError("Invalid body pose")
         if any(abs(sum(v * v for v in q) - 1) > .001 for q in rotations):
             raise ValueError("Invalid body quaternion")
+        _joint_values(message.get("joints", {}))
     elif kind == "ready":
         bodies = message.get("bodies")
         if not isinstance(bodies, list) or len(bodies) > MAX_BODIES or any(not isinstance(n, str) or not n for n in bodies) or len(set(bodies)) != len(bodies):
             raise ValueError("Invalid physics body bindings")
+        joints = message.get("joints", {})
+        if not isinstance(joints, dict) or len(joints) > MAX_BODIES:
+            raise ValueError("Invalid physics joint bindings")
+        for name, info in joints.items():
+            if not isinstance(info, dict) or type(info.get("available")) is not bool or not isinstance(info.get("reason"), str):
+                raise ValueError("Invalid physics joint metadata")
+            _joint_values({name: info.get("qpos")})
+            for key in ("range", "effort_range"):
+                limits = info.get(key)
+                if limits is None and key == "range":
+                    continue
+                if not isinstance(limits, list) or len(limits) != 2 or any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in limits):
+                    raise ValueError("Invalid physics joint limits")
     elif kind in {"command", "ack"}:
         if message.get("command") not in COMMANDS or type(message.get("id")) is not int or message["id"] < 1:
             raise ValueError("Invalid physics command")
+        if kind == "command" and message["command"] == "targets":
+            _joint_values(message.get("targets"))
+            if not message["targets"]:
+                raise ValueError("Empty physics joint targets")
     elif kind == "error":
         if not isinstance(message.get("message"), str):
             raise ValueError("Invalid physics error")

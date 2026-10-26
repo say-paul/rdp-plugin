@@ -47,7 +47,8 @@ class SimulationClient:
         if self.process is not None or self._closing:
             raise RuntimeError("Physics client has already been started or closed")
         request = dict(request, output_path=str(self.directory / "world.xml"))
-        payload = {"session": self.session, "export": request, "bodies": list(body_names), "rate_hz": self.rate_hz}
+        payload = {"session": self.session, "export": request, "bodies": list(body_names), "rate_hz": self.rate_hz,
+                   "servo_options": request.pop("servo_options", {})}
         request_path = self.directory / "request.json"
         request_path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
         env = os.environ.copy()
@@ -125,7 +126,7 @@ class SimulationClient:
                 pending = self._pending.pop(message["id"], None)
                 if pending is None or pending[0] != message["command"]:
                     message = {"type": "error", "message": "Unexpected physics acknowledgement"}
-                else:
+                elif message["command"] != "targets":
                     self._running = message["command"] in {"start", "resume"}
             result.append(message)
         if not self._closing and self.process is not None:
@@ -150,15 +151,17 @@ class SimulationClient:
             frame, self._frame = self._frame, None
             return frame
 
-    def command(self, command):
+    def command(self, command, **values):
         if command not in COMMANDS or not self._ready or self._closing:
             raise RuntimeError("Physics worker is not ready for this command")
         if len(self._pending) >= 32:
             raise RuntimeError("Too many pending physics commands")
         self._command_id += 1
-        message = {"version": VERSION, "session": self.session, "type": "command", "command": command, "id": self._command_id}
+        message = {**values, "version": VERSION, "session": self.session, "type": "command", "command": command, "id": self._command_id}
+        raw = encode(message)
+        decode(raw, self.session)
         try:
-            self._outgoing.put_nowait(encode(message))
+            self._outgoing.put_nowait(raw)
         except queue.Full as error:
             raise RuntimeError("Physics command buffer is full") from error
         self._pending[self._command_id] = (command, time.monotonic())

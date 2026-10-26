@@ -11,7 +11,7 @@ import unittest
 
 from robot_arm_library.physics.client import SimulationClient
 from robot_arm_library.physics.protocol import MAX_MESSAGE, decode, encode
-from robot_arm_library.world_exporter import SceneMeshInstance
+from robot_arm_library.world_exporter import RobotInstance, SceneMeshInstance
 from tests.test_world_physics import _cube_obj
 
 
@@ -127,6 +127,48 @@ class WorkerTests(unittest.TestCase):
             finally:
                 client.close()
             self.assertFalse(client.directory.exists())
+
+    def test_joint_targets_pause_resume_and_reset(self):
+        client = SimulationClient(sys.executable)
+        try:
+            source = client.directory / "arm.xml"
+            source.write_text('<mujoco><compiler angle="radian"/><option gravity="0 0 0"/>'
+                              '<worldbody><body name="base"><joint name="hinge" range="-1.69 1.69"/>'
+                              '<geom pos=".1 0 0" size=".03"/></body></worldbody></mujoco>')
+            robot = RobotInstance("arm", "arm", str(source), (0, 0, 1), (1, 0, 0, 0), {"hinge": 0})
+            request = {"version": 1, "robots": [asdict(robot)], "scene_meshes": [],
+                       "world_options": {"gravity": [0, 0, 0], "timestep": .002}}
+            client.start(request, ["arm_base"])
+            ready = await_event(client, lambda event: event["type"] == "ready")
+            self.assertTrue(ready["joints"]["arm_hinge"]["available"])
+            initial = client.latest_frame()
+            for target in (-1.690000057220459, 1.690000057220459):
+                client.command("targets", targets={"arm_hinge": target})
+                await_event(client, lambda event: event["type"] == "ack")
+                self.assertIsNone(client.latest_frame())
+            client.command("targets", targets={"arm_hinge": .6})
+            await_event(client, lambda event: event["type"] == "ack")
+            self.assertIsNone(client.latest_frame())
+            client.command("resume")
+            await_event(client, lambda event: event["type"] == "ack")
+            time.sleep(.3)
+            frame = client.latest_frame()
+            self.assertGreater(frame["joints"]["arm_hinge"], .3)
+            client.command("targets", targets={"arm_hinge": -.5})
+            await_event(client, lambda event: event["type"] == "ack")
+            self.assertTrue(client._running)
+            client.command("reset")
+            await_event(client, lambda event: event["type"] == "ack" and event["command"] == "reset")
+            frame = client.latest_frame()
+            self.assertEqual(frame["time"], 0)
+            self.assertEqual(frame["joints"], initial["joints"])
+            self.assertFalse(client._running)
+            client.command("targets", targets={"arm_hinge": 2})
+            error = await_event(client, lambda event: event["type"] == "error")
+            self.assertIn("2 not in [-1.69, 1.69]", error["message"])
+            self.assertNotIn("installation", error["message"])
+        finally:
+            client.close()
 
     def test_startup_and_command_timeout(self):
         client = self.start_worker(startup_timeout=-1)

@@ -11,6 +11,7 @@ import threading
 import time
 
 from .protocol import MAX_MESSAGE, VERSION, decode, encode
+from .control import JointServos
 from .runtime import ResetState, initialize
 
 
@@ -22,6 +23,7 @@ def run(request_path):
         sys.stdout.buffer.write(encode({"version": VERSION, "session": session, "type": kind, **values}))
         sys.stdout.buffer.flush()
 
+    ready = False
     try:
         with redirect_stdout(sys.stderr):
             import mujoco
@@ -43,6 +45,7 @@ def run(request_path):
                 if name and name.startswith(robot["prefix"]) and name not in sensors and name not in names:
                     raise ValueError(f"Unmapped MuJoCo robot body: {name}; reimport the compiled robot")
         reset = ResetState(mujoco, model, data)
+        servos = JointServos(mujoco, model, data, manifest, **payload.get("servo_options", {}))
         commands = queue.Queue(maxsize=64)
         reader_error = []
 
@@ -74,11 +77,12 @@ def run(request_path):
             nonlocal sequence
             mujoco.mj_forward(model, data)
             send("frame", sequence=sequence, time=float(data.time), lag=lag,
-                 positions=data.xpos[ids].tolist(), quaternions=data.xquat[ids].tolist())
+                 positions=data.xpos[ids].tolist(), quaternions=data.xquat[ids].tolist(), joints=servos.positions())
             sequence += 1
 
         frame()
-        send("ready", bodies=names, body_ids=ids)
+        send("ready", bodies=names, body_ids=ids, joints=servos.metadata)
+        ready = True
         while True:
             if reader_error:
                 raise RuntimeError(f"Physics command stream failed: {reader_error[0]}")
@@ -98,9 +102,14 @@ def run(request_path):
                     send("ack", command=command, id=message["id"])
                     return 0
                 if command == "reset":
+                    servos.reset()
                     reset.restore(mujoco, model, data)
                     running = False
                     lag = 0.0
+                elif command == "targets":
+                    servos.set_targets(message["targets"])
+                    send("ack", command=command, id=message["id"])
+                    continue
                 elif command == "pause":
                     running = False
                 elif command in {"start", "resume"}:
@@ -113,6 +122,7 @@ def run(request_path):
             steps = 0
             now = time.monotonic()
             while now >= next_step and steps < 20:
+                servos.step()
                 mujoco.mj_step(model, data)
                 next_step += timestep
                 steps += 1
@@ -123,7 +133,8 @@ def run(request_path):
                 frame()
                 next_frame = now + 1.0 / rate
     except Exception as error:
-        send("error", message=f"{type(error).__name__}: {error}. Check the selected external Python and MuJoCo installation.")
+        guidance = " Check the selected external Python and MuJoCo installation." if not ready else ""
+        send("error", message=f"{type(error).__name__}: {error}.{guidance}")
         return 1
 
 

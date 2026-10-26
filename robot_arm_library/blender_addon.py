@@ -31,7 +31,7 @@ from .world_exporter import RobotInstance, SceneMeshInstance, SensorMount, World
 bl_info = {
     "name": "MuJoCo Robot Arm Library",
     "author": "Caryam",
-    "version": (0, 9, 0),
+    "version": (0, 9, 3),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Robot Library",
     "description": "Discover robot arms from a MuJoCo setup and drag them into the scene",
@@ -1228,11 +1228,22 @@ def _control_root(context: bpy.types.Context) -> bpy.types.Object | None:
 
 def _draw_joint_controls(layout: bpy.types.UILayout, root: bpy.types.Object, controls: list[bpy.types.Object]) -> None:
     layout = layout.column()
-    layout.enabled = not live_physics.active()
+    running = live_physics.active()
     layout.label(text=root.name, icon="CONSTRAINT_BONE")
+    if running:
+        layout.label(text="Move a target to enable its effort-limited servo", icon="PHYSICS")
     for joint in controls:
-        layout.prop(joint, '["qpos"]', text=joint.name.removeprefix("Joint: "), slider=True)
+        row = layout.row(align=True)
+        info = live_physics.joint_info(joint) if running else None
+        metadata, actual = info if info is not None else (None, None)
+        row.enabled = not running or (live_physics.joint_controls_enabled() and metadata is not None and metadata["available"])
+        row.prop(joint, '["qpos"]', text=joint.name.removeprefix("Joint: ") + (" target" if running else ""), slider=True)
+        if running and actual is not None:
+            row.label(text=f"Actual: {actual:.3f}")
+        if running and metadata is not None and not metadata["available"]:
+            layout.label(text=metadata["reason"], icon="INFO")
     action_row = layout.row(align=True)
+    action_row.enabled = not running
     reset_operator = action_row.operator("robot_library.reset_pose", text="Reset", icon="LOOP_BACK")
     reset_operator.root_name = root.name
     keyframe_operator = action_row.operator("robot_library.keyframe_pose", text="Keyframe", icon="KEY_HLT")
@@ -2544,6 +2555,9 @@ def _remove_scene_properties() -> None:
         "robot_mujoco_gravity",
         "robot_mujoco_timestep",
         "robot_mujoco_rate",
+        "robot_mujoco_servo_kp",
+        "robot_mujoco_servo_kd",
+        "robot_mujoco_servo_effort",
         "robot_core_bridge_url",
         "robot_core_host",
         "robot_core_port",
@@ -2630,6 +2644,12 @@ def register() -> None:
         name="Physics Timestep", default=0.002, min=0.00001, max=0.1, precision=5,
     )
     bpy.types.Scene.robot_mujoco_rate = IntProperty(name="Viewport Updates", default=30, min=1, max=120)
+    bpy.types.Scene.robot_mujoco_servo_kp = FloatProperty(name="Joint Stiffness", default=40, min=.01, max=100000)
+    bpy.types.Scene.robot_mujoco_servo_kd = FloatProperty(name="Joint Damping", default=4, min=0, max=10000)
+    bpy.types.Scene.robot_mujoco_servo_effort = FloatProperty(
+        name="Maximum Joint Effort", description="Temporary servo cap in Nm for hinges or N for slides; MJCF force limits may reduce it",
+        default=20, min=.001, max=100000,
+    )
     bpy.types.Scene.robot_core_bridge_url = StringProperty(name="Core Bridge", default="http://127.0.0.1:8765")
     bpy.types.Scene.robot_core_host = StringProperty(name="Core Host", default="localhost")
     bpy.types.Scene.robot_core_port = IntProperty(name="Core Port", default=17080, min=1, max=65535)

@@ -12,11 +12,12 @@ from mathutils import Matrix, Quaternion, Vector
 
 from .. import mounting
 from .client import SimulationClient
+from .control import normalize_joint_target
+from .geometry import GeometrySnapshot
 
 
 _session = None
 _status = "Stopped"
-_updating = False
 _closing_clients = []
 
 
@@ -141,13 +142,18 @@ class Session:
         self.client = client
         self.state = "STARTING"
         self.bindings = []
+        self.joints = {}
+        self.joint_metadata = {}
+        self.actual_joints = {}
+        self.queued_targets = {}
+        self.target_command = None
+        self.reset_requested = False
         self.time = 0.0
         self.lag = 0.0
         self.applied = False
         self.expected = []
         self.names = tuple(sorted(obj.as_pointer() for obj in scene.objects))
-        self.settings = (tuple(scene.robot_mujoco_gravity), scene.robot_mujoco_timestep,
-                         scene.robot_mujoco_rate, scene.robot_mujoco_python)
+        self.settings = self._settings()
         participants = set()
         body_names = set()
         for robot in robots:
@@ -169,6 +175,9 @@ class Session:
                     raise ValueError(f"Duplicate MuJoCo body binding: {name}")
                 body_names.add(name)
                 self.bindings.append(Binding(obj, name, Vector((1, 1, 1)), Matrix.Identity(4)))
+            for obj in root.children_recursive:
+                if "qpos" in obj and mounting.robot_root(obj) == root:
+                    self.joints[robot.prefix + str(obj.get("mujoco_joint_name", ""))] = obj
             participants.add(root)
             participants.update(root.children_recursive)
         for mesh in meshes:
@@ -193,7 +202,15 @@ class Session:
         self.bindings.sort(key=lambda binding: _depth(binding.obj))
         self.body_names = sorted(body_names)
         self.authoring = AuthoringState(scene, participants)
+        self.geometry = GeometrySnapshot(participants, bpy.context.evaluated_depsgraph_get())
+        self.initial_targets = {obj: float(obj["qpos"]) for obj in self.joints.values()}
         self.capture_expected()
+
+    def _settings(self):
+        scene = self.scene
+        return (tuple(scene.robot_mujoco_gravity), scene.robot_mujoco_timestep,
+                scene.robot_mujoco_rate, scene.robot_mujoco_python,
+                scene.robot_mujoco_servo_kp, scene.robot_mujoco_servo_kd, scene.robot_mujoco_servo_effort)
 
     def capture_expected(self):
         self.expected = [(obj, obj.name, obj.parent, obj.matrix_basis.copy(), obj.matrix_parent_inverse.copy(),
@@ -219,15 +236,22 @@ class Session:
             raise RuntimeError("Timeline changed; live physics stopped")
         if tuple(sorted(obj.as_pointer() for obj in self.scene.objects)) != self.names:
             raise RuntimeError("Scene objects changed; Stop and Start a fresh physics snapshot")
-        current = (tuple(self.scene.robot_mujoco_gravity), self.scene.robot_mujoco_timestep,
-                   self.scene.robot_mujoco_rate, self.scene.robot_mujoco_python)
-        if current != self.settings or self._physics_signature() != self.physics_signature:
+        if self._settings() != self.settings or self._physics_signature() != self.physics_signature:
             raise RuntimeError("Physics settings changed; Start a fresh snapshot")
         for obj, name, parent, basis, inverse, qpos in self.expected:
             if obj.name != name or obj.parent != parent or not _matrix_close(obj.matrix_basis, basis) or not _matrix_close(obj.matrix_parent_inverse, inverse):
                 raise RuntimeError(f"Authoring transform changed: {name}; Start a fresh snapshot")
             if qpos is not None and float(obj["qpos"]) != qpos:
-                raise RuntimeError("Joint pose changed; Stop physics before editing the authoring pose")
+                name = next((name for name, joint in self.joints.items() if joint == obj), None)
+                if self.reset_requested:
+                    continue
+                if name is None or not self.joint_metadata.get(name, {}).get("available") or self.state not in {"RUNNING", "PAUSED"}:
+                    raise RuntimeError("This joint cannot be controlled live; Stop before editing it")
+                value = normalize_joint_target(float(obj["qpos"]), self.joint_metadata[name]["range"], name)
+                if value != float(obj["qpos"]):
+                    obj["qpos"] = value
+                    obj.update_tag(refresh={"OBJECT"})
+                self.queued_targets[name] = value
 
     def apply(self, frame):
         positions = frame["positions"]
@@ -244,6 +268,7 @@ class Session:
             obj.matrix_basis = world
             bpy.context.view_layer.update()
         self.last_frame = frame
+        self.actual_joints = frame.get("joints", {})
         self.time = frame["time"]
         self.lag = float(frame.get("lag", 0.0))
         self.applied = True
@@ -251,6 +276,7 @@ class Session:
 
     def tick(self):
         self.validate_scene()
+        self.geometry.validate(bpy.context.evaluated_depsgraph_get())
         for event in self.client.poll():
             kind = event["type"]
             if kind == "error":
@@ -258,6 +284,9 @@ class Session:
             if kind == "ready":
                 if event["bodies"] != self.body_names:
                     raise ValueError("Runtime body bindings disagree with the exported scene")
+                self.joint_metadata = event.get("joints", {})
+                if set(self.joint_metadata) != set(self.joints):
+                    raise ValueError("Runtime joint bindings disagree with the exported scene")
                 self.authoring.suspend()
                 self.capture_expected()
                 self.client.command("start")
@@ -267,6 +296,19 @@ class Session:
                     self.state = "RUNNING"
                 elif command in {"pause", "reset"}:
                     self.state = "PAUSED"
+                    if command == "reset":
+                        self.queued_targets.clear()
+                        self.reset_requested = False
+                        for obj, value in self.initial_targets.items():
+                            obj["qpos"] = value
+                            obj.update_tag(refresh={"OBJECT"})
+                        self.capture_expected()
+                elif command == "targets" and event["id"] == self.target_command:
+                    self.target_command = None
+        if self.queued_targets and self.target_command is None and not self.reset_requested:
+            self.target_command = self.client.command("targets", targets=dict(self.queued_targets))
+            self.queued_targets.clear()
+            self.capture_expected()
         frame = self.client.latest_frame()
         if frame is not None:
             self.apply(frame)
@@ -288,7 +330,9 @@ def start(scene):
         session = Session(scene, robots, meshes, client)
         request = {"version": 1, "output_path": str(output), "robots": [asdict(robot) for robot in robots],
                    "scene_meshes": [asdict(mesh) for mesh in meshes],
-                   "world_options": {"gravity": list(scene.robot_mujoco_gravity), "timestep": scene.robot_mujoco_timestep}}
+                   "world_options": {"gravity": list(scene.robot_mujoco_gravity), "timestep": scene.robot_mujoco_timestep},
+                   "servo_options": {"kp": scene.robot_mujoco_servo_kp, "kd": scene.robot_mujoco_servo_kd,
+                                     "max_effort": scene.robot_mujoco_servo_effort}}
         _session = session
         _status = "Starting external MuJoCo…"
         client.start(request, session.body_names)
@@ -306,6 +350,22 @@ def command(name):
     if _session is None:
         raise RuntimeError("No live MuJoCo session")
     _session.client.command(name)
+    if name == "reset":
+        _session.reset_requested = True
+        _session.queued_targets.clear()
+
+
+def joint_info(obj):
+    if _session is None:
+        return None
+    for name, joint in _session.joints.items():
+        if joint == obj:
+            return (_session.joint_metadata.get(name), _session.actual_joints.get(name))
+    return None
+
+
+def joint_controls_enabled():
+    return _session is not None and not _session.reset_requested and state() in {"RUNNING", "PAUSED"}
 
 
 def stop(reason="Stopped", *, wait=False):
@@ -344,20 +404,17 @@ def _redraw():
 
 
 def _tick():
-    global _status, _updating
+    global _status
     session = _session
     if session is None:
         return None
     try:
-        _updating = True
         session.tick()
         _status = f"{session.state.title()} · {session.time:.3f} s · lag {session.lag:.3f} s"
         _redraw()
     except Exception as error:
         stop(f"Error: {error}")
         return None
-    finally:
-        _updating = False
     return 1.0 / max(1, session.scene.robot_mujoco_rate)
 
 
@@ -368,14 +425,10 @@ def _stop_for_lifecycle(*_args):
 
 @persistent
 def _geometry_changed(scene, depsgraph):
-    if _updating or _session is None or _session.scene != scene:
+    if _session is None or _session.scene != scene:
         return
-    participants = {obj for obj, *_ in _session.authoring.objects}
-    for update in depsgraph.updates:
-        original = getattr(update.id, "original", update.id)
-        if isinstance(original, bpy.types.Object) and original in participants and update.is_updated_geometry:
-            stop("Geometry changed; Start a fresh physics snapshot")
-            return
+    # Defer validation/restoration to the timer, outside depsgraph evaluation.
+    _session.geometry.mark_updates(depsgraph)
 
 
 def register_handlers():
@@ -426,6 +479,9 @@ def draw(layout, scene):
     settings.prop(scene, "robot_mujoco_gravity", text="Gravity")
     settings.prop(scene, "robot_mujoco_timestep", text="Timestep (s)")
     settings.prop(scene, "robot_mujoco_rate", text="Viewport Hz")
+    settings.prop(scene, "robot_mujoco_servo_kp", text="Joint stiffness")
+    settings.prop(scene, "robot_mujoco_servo_kd", text="Joint damping")
+    settings.prop(scene, "robot_mujoco_servo_effort", text="Max effort (Nm/N)")
     layout.label(text="Live in Blender · all exportable scene objects")
     row = layout.row(align=True)
     button = row.row(align=True)
