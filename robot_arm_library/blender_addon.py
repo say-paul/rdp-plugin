@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import bpy
-from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import Node, NodeTree, Operator, Panel, PropertyGroup, UIList
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 from mathutils import Euler, Matrix, Quaternion, Vector
@@ -23,14 +23,15 @@ from .behavior_graph import BehaviorGraph, BehaviorLink, BehaviorNode, PortSpec
 from .container_builder import DEFAULT_BASE_IMAGE
 from .port_catalog import catalog_node_template
 from . import mounting
+from .physics import blender as live_physics
 from .setup_parser import discover_sensor_definitions
-from .world_exporter import RobotInstance, SceneMeshInstance, SensorMount, write_world_export
+from .world_exporter import RobotInstance, SceneMeshInstance, SensorMount, WorldOptions, write_world_export
 
 
 bl_info = {
     "name": "MuJoCo Robot Arm Library",
     "author": "Caryam",
-    "version": (0, 8, 17),
+    "version": (0, 9, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Robot Library",
     "description": "Discover robot arms from a MuJoCo setup and drag them into the scene",
@@ -1125,10 +1126,14 @@ def _export_usd_scene(output: Path) -> Path:
 
 
 def _export_world_file(filepath: str) -> tuple[Path, Path, Path]:
+    if live_physics.active():
+        raise RuntimeError("Stop live MuJoCo physics before exporting or launching Play")
     output = Path(bpy.path.abspath(filepath)).expanduser().resolve()
-    executable = bpy.context.scene.robot_mujoco_python.strip() or shutil.which("python") or "python"
+    scene = bpy.context.scene
+    executable = scene.robot_mujoco_python.strip() or shutil.which("python") or "python"
     exported = write_world_export(
         output, _world_robot_instances(), _world_scene_meshes(output), python_executable=executable,
+        world_options=WorldOptions(gravity=tuple(scene.robot_mujoco_gravity), timestep=scene.robot_mujoco_timestep),
     )
     _export_usd_scene(output)
     return exported
@@ -1222,6 +1227,8 @@ def _control_root(context: bpy.types.Context) -> bpy.types.Object | None:
 
 
 def _draw_joint_controls(layout: bpy.types.UILayout, root: bpy.types.Object, controls: list[bpy.types.Object]) -> None:
+    layout = layout.column()
+    layout.enabled = not live_physics.active()
     layout.label(text=root.name, icon="CONSTRAINT_BONE")
     for joint in controls:
         layout.prop(joint, '["qpos"]', text=joint.name.removeprefix("Joint: "), slider=True)
@@ -2258,10 +2265,11 @@ class ROBOT_PT_mujoco_world(Panel):
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
         scene = context.scene
-        layout.prop(scene, "robot_mujoco_python", text="Python")
         row = layout.row(align=True)
+        row.enabled = not live_physics.active()
         row.operator("robot_library.export_world", text="Export", icon="EXPORT")
         row.operator("robot_library.launch_mujoco", text="Play", icon="PLAY")
+        live_physics.draw(layout, scene)
         obj = context.active_object
         if obj is None:
             layout.label(text="Select a mesh to inspect physics", icon="INFO")
@@ -2496,7 +2504,22 @@ CLASSES = (
     ROBOT_PT_robot_build,
     ROBOT_PT_behavior_editor,
     *mounting.MOUNT_CLASSES,
+    *live_physics.CLASSES,
 )
+
+
+def _guard_authoring_operator(cls) -> None:
+    original = getattr(cls, "poll", None)
+
+    def poll(operator_cls, context):
+        return not live_physics.active() and (original(context) if original is not None else True)
+
+    cls.poll = classmethod(poll)
+
+
+for _operator in CLASSES:
+    if issubclass(_operator, Operator) and _operator not in live_physics.CLASSES and _operator is not ROBOT_OT_joint_window:
+        _guard_authoring_operator(_operator)
 
 
 def _remove_scene_properties() -> None:
@@ -2518,6 +2541,9 @@ def _remove_scene_properties() -> None:
         "robot_mount_distance",
         "robot_magnet_alignment",
         "robot_mujoco_python",
+        "robot_mujoco_gravity",
+        "robot_mujoco_timestep",
+        "robot_mujoco_rate",
         "robot_core_bridge_url",
         "robot_core_host",
         "robot_core_port",
@@ -2554,6 +2580,7 @@ def _unregister_existing_classes() -> None:
 
 
 def register() -> None:
+    live_physics.unregister_handlers()
     _remove_scene_properties()
     _unregister_existing_classes()
     for cls in CLASSES:
@@ -2596,6 +2623,13 @@ def register() -> None:
         default="OPPOSE",
     )
     bpy.types.Scene.robot_mujoco_python = StringProperty(name="MuJoCo Python", default="python")
+    bpy.types.Scene.robot_mujoco_gravity = FloatVectorProperty(
+        name="Gravity", size=3, default=(0.0, 0.0, -9.81), subtype="ACCELERATION",
+    )
+    bpy.types.Scene.robot_mujoco_timestep = FloatProperty(
+        name="Physics Timestep", default=0.002, min=0.00001, max=0.1, precision=5,
+    )
+    bpy.types.Scene.robot_mujoco_rate = IntProperty(name="Viewport Updates", default=30, min=1, max=120)
     bpy.types.Scene.robot_core_bridge_url = StringProperty(name="Core Bridge", default="http://127.0.0.1:8765")
     bpy.types.Scene.robot_core_host = StringProperty(name="Core Host", default="localhost")
     bpy.types.Scene.robot_core_port = IntProperty(name="Core Port", default=17080, min=1, max=65535)
@@ -2619,9 +2653,11 @@ def register() -> None:
     bpy.types.Scene.robot_build_status = StringProperty(name="Build Status", default="Not built")
     bpy.types.NODE_MT_add.append(_draw_behavior_add_menu)
     bpy.app.timers.register(_refresh_active_library, first_interval=0.1)
+    live_physics.register_handlers()
 
 
 def unregister() -> None:
+    live_physics.unregister_handlers()
     if bpy.app.timers.is_registered(_refresh_active_library):
         bpy.app.timers.unregister(_refresh_active_library)
     try:

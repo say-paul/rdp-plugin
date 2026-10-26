@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .sensor_spec import CameraSensorSpec, LidarSensorSpec, SensorDefinition
-from .world_exporter import RobotInstance, RobotMount, SceneMeshInstance, SensorMount, write_world_export
+from .world_exporter import RobotInstance, RobotMount, SceneMeshInstance, SensorMount, WorldOptions, write_world_export
 
 
 def _vectors(value: dict[str, Any], *keys: str) -> dict[str, Any]:
@@ -48,7 +48,7 @@ def export_request(payload: dict[str, Any]) -> tuple[Path, Path, Path]:
         mesh = _vectors(value, "position", "quaternion", "scale", "rgba")
         mesh["mount"] = _mount(value["mount"])
         meshes.append(SceneMeshInstance(**mesh))
-    return write_world_export(payload["output_path"], robots, meshes)
+    return write_world_export(payload["output_path"], robots, meshes, world_options=WorldOptions(**payload.get("world_options", {})))
 
 
 def main() -> int:

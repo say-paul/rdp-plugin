@@ -94,6 +94,18 @@ The **MuJoCo Python** field controls which Python executable launches the render
 
 To capture mounted sensor output without opening the viewer, run `MUJOCO_GL=egl python render_world.py --sensors-only` from the export directory. It prints lidar readings and saves depth frames there.
 
+### Live MuJoCo physics in Blender
+
+Open **Scene Properties > MuJoCo World**, or **Sim > MuJoCo** in the viewport sidebar. Select an external **Python** executable with MuJoCo installed; configure scene-wide **Gravity**, **Timestep**, and **Viewport Hz**. Gravity/timestep also apply to Export and the separate external-viewer **Play** button. No Blender-side MuJoCo installation is needed to run an already-imported compiled robot scene or ordinary meshes.
+
+- **Start** exports a temporary snapshot of all supported scene objects, independent of selection, and streams MuJoCo body poses into Blender. Export/Play and conflicting add-on authoring operations are unavailable while live physics owns the scene.
+- **Pause / Resume** pauses or resumes the actual solver, not just the viewport. **Reset** restores the initialized simulation and remains paused.
+- **Stop** restores the pre-Start authoring transforms, joint properties, drivers, animation, constraints, rigid-body world and frame; the owned worker and temporary files are cleaned up. Saving, loading, undo/redo, changing scenes, incompatible edits and add-on unregister also stop safely. Simulation poses are not saved or baked.
+
+Ordinary meshes remain fixed colliders unless configured as Active rigid bodies; mass, friction and collision shape remain in **Physics Properties**. MJCF robots keep their source dynamics, including floating bases and rigid surface/magnetic assemblies. Fast Assembly and Detailed Mesh compiled previews are supported; placeholder/XML-fallback previews, reflected transforms and sheared physical objects are rejected rather than partially animated. Geometry or physics edits require Stop and a fresh Start. Blender's competing rigid-body solver and participant animation are temporarily suspended; this is not a native Blender engine replacement.
+
+The integration lives in [`robot_arm_library/physics/`](robot_arm_library/physics/): shared initialization, pipe protocol, external worker/client, and reversible Blender synchronization. Standalone exports include `caryam_physics_runtime.py` beside `render_world.py`; keep that companion with the exported bundle. See the [implementation plan](docs/superpowers/plans/2026-10-25-mujoco-blender-live-physics.md) for scope and acceptance criteria. Timeline baking, live sensor streaming, ROS2 control and edge deployment are not included.
+
 ## Data graph editor
 
 Use **Open Data Graph** to switch the current area to the **Caryam Data Graph** node editor. Add nodes from the sidebar and connect typed ports in the node view. Save/load `.json` for the full Caryam graph or `.yaml`/`.yml` for application nodes in `flow.yaml` form. YAML I/O needs PyYAML in Blender's Python; the add-on reports a clear error if it is unavailable. Each JSON port records its data type, tensor shape, delivery mode (`stream`, `state`, `event`, or `command`), timestamp and validity requirements, and optional dtype, semantic type, unit, rate, and variable-length contract. Links with incompatible declared contracts are rejected. **Catalog Nodes** adds a Robot State source, Robot Command sink, or the selected Sensor Library item with generated ports; manually created Application ports remain editable.

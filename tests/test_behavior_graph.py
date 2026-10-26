@@ -220,7 +220,7 @@ class BehaviorGraphTests(unittest.TestCase):
 
             self.assertTrue(all(path.exists() for path in files))
             self.assertIn("launch_passive", files[2].read_text(encoding="utf-8"))
-            self.assertIn('prefix + "home"', files[2].read_text(encoding="utf-8"))
+            self.assertIn('prefix + "home"', (root / "caryam_physics_runtime.py").read_text(encoding="utf-8"))
             self.assertIn("time.perf_counter", files[2].read_text(encoding="utf-8"))
 
     def test_world_export_allows_an_empty_physics_scene(self):
@@ -305,9 +305,10 @@ class BehaviorGraphTests(unittest.TestCase):
             self.assertIn('<attach model="model_free_1" prefix="free_1_"', world_xml)
             self.assertNotIn('<body name="free_1"', world_xml)
             self.assertIn('"free_base": true', manifest_path.read_text(encoding="utf-8"))
-            render_script = render_path.read_text(encoding="utf-8")
-            self.assertIn('robot.get("free_base")', render_script)
-            self.assertIn('robot["position"]', render_script)
+            self.assertIn("initialize(mujoco, model, manifest)", render_path.read_text(encoding="utf-8"))
+            runtime_script = (root / "caryam_physics_runtime.py").read_text(encoding="utf-8")
+            self.assertIn('robot.get("free_base")', runtime_script)
+            self.assertIn('robot["position"]', runtime_script)
 
 
 if __name__ == "__main__":

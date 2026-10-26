@@ -41,6 +41,18 @@ def _load_export_mujoco():
 
 
 @dataclass(frozen=True)
+class WorldOptions:
+    gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
+    timestep: float = 0.002
+
+    def __post_init__(self):
+        if len(self.gravity) != 3 or not all(math.isfinite(value) for value in self.gravity):
+            raise ValueError("Gravity requires three finite values")
+        if not math.isfinite(self.timestep) or self.timestep <= 0:
+            raise ValueError("Physics timestep must be finite and positive")
+
+
+@dataclass(frozen=True)
 class SensorMount:
     sensor: SensorDefinition
     mount_name: str
@@ -205,16 +217,26 @@ def build_world_xml(
     instances: Iterable[RobotInstance],
     output_path: str | Path,
     scene_meshes: Iterable[SceneMeshInstance] = (),
+    *, world_options: WorldOptions | None = None,
 ) -> ElementTree.ElementTree:
     """Build a MuJoCo 3.2+ world using ``asset/model`` and ``attach``."""
     output = Path(output_path).expanduser().resolve()
     instance_list = list(instances)
     scene_mesh_list = list(scene_meshes)
     if any(instance.mount is not None for instance in instance_list) or any(mesh.mount is not None for mesh in scene_mesh_list):
-        return _build_mounted_world(instance_list, output, scene_mesh_list)
+        tree = _build_mounted_world(instance_list, output, scene_mesh_list)
+        options = world_options or WorldOptions()
+        option = tree.getroot().find("option")
+        if option is None:
+            option = ElementTree.SubElement(tree.getroot(), "option")
+        option.set("timestep", str(options.timestep))
+        option.set("gravity", " ".join(format(value, ".15g") for value in options.gravity))
+        return tree
+    options = world_options or WorldOptions()
     root = ElementTree.Element("mujoco", {"model": "caryam_world"})
     ElementTree.SubElement(root, "compiler", {"autolimits": "true"})
-    ElementTree.SubElement(root, "option", {"timestep": "0.002", "gravity": "0 0 -9.81"})
+    ElementTree.SubElement(root, "option", {"timestep": str(options.timestep),
+                                          "gravity": " ".join(format(value, ".15g") for value in options.gravity)})
     asset = ElementTree.SubElement(root, "asset")
     ElementTree.SubElement(
         asset,
@@ -629,73 +651,9 @@ import mujoco.viewer
 ROOT = Path(__file__).resolve().parent
 manifest = json.loads((ROOT / {manifest_name!r}).read_text(encoding="utf-8"))
 model = mujoco.MjModel.from_xml_path(str(ROOT / {world_name!r}))
-data = mujoco.MjData(model)
-
-
-def robot_joint_ids(prefix):
-    joint_ids = set()
-    for body_id in range(model.nbody):
-        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
-        if not body_name or not body_name.startswith(prefix):
-            continue
-        first_joint = int(model.body_jntadr[body_id])
-        joint_count = int(model.body_jntnum[body_id])
-        joint_ids.update(range(first_joint, first_joint + joint_count))
-    return sorted(joint_ids)
-
-
-def joint_qpos_width(joint_id):
-    start = int(model.jnt_qposadr[joint_id])
-    end = int(model.jnt_qposadr[joint_id + 1]) if joint_id + 1 < model.njnt else model.nq
-    return start, end
-
-
-def multiply_quaternions(left, right):
-    lw, lx, ly, lz = left
-    rw, rx, ry, rz = right
-    return (
-        lw * rw - lx * rx - ly * ry - lz * rz,
-        lw * rx + lx * rw + ly * rz - lz * ry,
-        lw * ry - lx * rz + ly * rw + lz * rx,
-        lw * rz + lx * ry - ly * rx + lz * rw,
-    )
-
-
-for robot in manifest["robots"]:
-    prefix = robot["prefix"]
-    joint_ids = robot_joint_ids(prefix)
-    home_key = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, prefix + "home")
-    if home_key >= 0:
-        for joint_id in joint_ids:
-            start, end = joint_qpos_width(joint_id)
-            data.qpos[start:end] = model.key_qpos[home_key, start:end]
-    for joint_name, value in robot["qpos"].items():
-        full_name = prefix + joint_name
-        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, full_name)
-        if joint_id < 0:
-            continue
-        qpos_address = int(model.jnt_qposadr[joint_id])
-        if int(model.jnt_type[joint_id]) in {{2, 3}}:
-            data.qpos[qpos_address] = float(value)
-    if robot.get("free_base"):
-        free_joint = next(
-            (joint_id for joint_id in joint_ids if int(model.jnt_type[joint_id]) == int(mujoco.mjtJoint.mjJNT_FREE)),
-            -1,
-        )
-        if free_joint >= 0:
-            qpos_address = int(model.jnt_qposadr[free_joint])
-            rotation = robot["quaternion"]
-            inverse_rotation = (rotation[0], -rotation[1], -rotation[2], -rotation[3])
-            local_position = (0.0, *data.qpos[qpos_address:qpos_address + 3])
-            rotated_position = multiply_quaternions(
-                multiply_quaternions(rotation, local_position), inverse_rotation,
-            )
-            for index, value in enumerate(robot["position"]):
-                data.qpos[qpos_address + index] = rotated_position[index + 1] + float(value)
-            orientation = multiply_quaternions(rotation, data.qpos[qpos_address + 3:qpos_address + 7])
-            data.qpos[qpos_address + 3:qpos_address + 7] = orientation
-
-mujoco.mj_forward(model, data)
+from runpy import run_path
+initialize = run_path(str(ROOT / "caryam_physics_runtime.py"))["initialize"]
+data = initialize(mujoco, model, manifest)
 
 for robot in manifest["robots"]:
     for mount in robot.get("sensors", []):
@@ -768,6 +726,7 @@ def _write_world_export_local(
     output_path: str | Path,
     instances: Iterable[RobotInstance],
     scene_meshes: Iterable[SceneMeshInstance] = (),
+    *, world_options: WorldOptions | None = None,
 ) -> tuple[Path, Path, Path]:
     """Write a world using the current interpreter's available MuJoCo backend."""
     output = Path(output_path).expanduser().resolve()
@@ -777,7 +736,7 @@ def _write_world_export_local(
     for instance in instance_list:
         if any(mount.body_name for mount in instance.sensors):
             _write_sensorized_model(output, instance)
-    world_tree = build_world_xml(instance_list, output, scene_mesh_list)
+    world_tree = build_world_xml(instance_list, output, scene_mesh_list, world_options=world_options)
     ElementTree.indent(world_tree, space="  ")
     world_tree.write(output, encoding="utf-8", xml_declaration=True)
 
@@ -787,6 +746,7 @@ def _write_world_export_local(
             {
                 "version": 1,
                 "world_xml": output.name,
+                "world_options": asdict(world_options or WorldOptions()),
                 "robots": [_manifest_value(instance) for instance in instance_list],
                 "scene_meshes": [_scene_mesh_manifest_value(instance) for instance in scene_mesh_list],
             },
@@ -797,17 +757,21 @@ def _write_world_export_local(
     )
     render_path = output.with_name("render_world.py")
     render_path.write_text(_render_script(manifest_path.name, output.name), encoding="utf-8")
+    helper = Path(__file__).parent / "physics" / "runtime.py"
+    output.with_name("caryam_physics_runtime.py").write_text(helper.read_text(encoding="utf-8"), encoding="utf-8")
     return output, manifest_path, render_path
 
 
 def _write_world_export_external(
     output: Path, instances: list[RobotInstance], scene_meshes: list[SceneMeshInstance], executable: str,
+    world_options: WorldOptions | None = None,
 ) -> tuple[Path, Path, Path]:
     robots = [asdict(instance) for instance in instances]
     meshes = [asdict(mesh) for mesh in scene_meshes]
     for value in (*robots, *meshes):
         value["source_path"] = str(Path(value["source_path"]).expanduser().resolve())
-    payload = {"version": 1, "output_path": str(output), "robots": robots, "scene_meshes": meshes}
+    payload = {"version": 1, "output_path": str(output), "robots": robots, "scene_meshes": meshes,
+               "world_options": asdict(world_options or WorldOptions())}
     env = os.environ.copy()
     package_parent = str(Path(__file__).resolve().parent.parent)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (package_parent, env.get("PYTHONPATH", ""))))
@@ -844,14 +808,15 @@ def write_world_export(
     scene_meshes: Iterable[SceneMeshInstance] = (),
     *,
     python_executable: str | None = None,
+    world_options: WorldOptions | None = None,
 ) -> tuple[Path, Path, Path]:
     """Export locally, or use the selected Python if its MuJoCo backend is needed."""
     output = Path(output_path).expanduser().resolve()
     instance_list = list(instances)
     scene_mesh_list = list(scene_meshes)
     try:
-        return _write_world_export_local(output, instance_list, scene_mesh_list)
+        return _write_world_export_local(output, instance_list, scene_mesh_list, world_options=world_options)
     except MuJoCoBackendUnavailable:
         if python_executable is None:
             raise
-        return _write_world_export_external(output, instance_list, scene_mesh_list, python_executable)
+        return _write_world_export_external(output, instance_list, scene_mesh_list, python_executable, world_options)
