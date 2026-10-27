@@ -137,7 +137,7 @@ class AuthoringState:
 
 
 class Session:
-    def __init__(self, scene, robots, meshes, client):
+    def __init__(self, scene, robots, meshes, client, *, scene_sensors=()):
         self.scene = scene
         self.client = client
         self.state = "STARTING"
@@ -192,8 +192,19 @@ class Session:
             self.bindings.append(Binding(obj, name, obj.matrix_world.to_scale(), Matrix.Identity(4)))
             participants.add(obj)
             participants.update(obj.children_recursive)
+        for sensor in scene_sensors:
+            obj = scene.objects.get(sensor.object_name)
+            if obj is None:
+                raise ValueError(f"Scene sensor disappeared: {sensor.object_name}")
+            _validate_transform(obj)
+            if sensor.mount_name in body_names:
+                raise ValueError(f"Duplicate sensor body binding: {sensor.mount_name}")
+            body_names.add(sensor.mount_name)
+            self.bindings.append(Binding(obj, sensor.mount_name, obj.matrix_world.to_scale(), Matrix.Identity(4)))
+            participants.add(obj)
+            participants.update(obj.children_recursive)
         if not self.bindings:
-            raise ValueError("No supported robots or meshes to simulate")
+            raise ValueError("No supported robots, meshes or sensors to simulate")
         for obj in list(participants):
             parent = obj.parent
             while parent is not None:
@@ -223,7 +234,7 @@ class Session:
         for obj, *_ in self.authoring.objects:
             rigid = obj.rigid_body
             mount = obj.caryam_mount
-            result.append((obj.hide_render, obj.get("model_path"), obj.get("mujoco_dynamic"),
+            result.append((obj.hide_render, obj.get("model_path"), obj.get("mujoco_dynamic"), obj.get("sensor_definition_json"),
                            mount.enabled, mount.target, mount.source_anchor,
                            (rigid.type, rigid.enabled, rigid.kinematic, rigid.mass, rigid.friction,
                             rigid.restitution, rigid.collision_shape) if rigid else None))
@@ -327,9 +338,10 @@ def start(scene):
         output = client.directory / "world.xml"
         robots = addon._world_robot_instances()
         meshes = addon._world_scene_meshes(output)
-        session = Session(scene, robots, meshes, client)
+        sensors = addon._world_scene_sensors()
+        session = Session(scene, robots, meshes, client, scene_sensors=sensors)
         request = {"version": 1, "output_path": str(output), "robots": [asdict(robot) for robot in robots],
-                   "scene_meshes": [asdict(mesh) for mesh in meshes],
+                   "scene_meshes": [asdict(mesh) for mesh in meshes], "scene_sensors": [asdict(sensor) for sensor in sensors],
                    "world_options": {"gravity": list(scene.robot_mujoco_gravity), "timestep": scene.robot_mujoco_timestep},
                    "servo_options": {"kp": scene.robot_mujoco_servo_kp, "kd": scene.robot_mujoco_servo_kd,
                                      "max_effort": scene.robot_mujoco_servo_effort}}

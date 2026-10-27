@@ -12,73 +12,9 @@ import mujoco.viewer
 ROOT = Path(__file__).resolve().parent
 manifest = json.loads((ROOT / 'caryam_world.json').read_text(encoding="utf-8"))
 model = mujoco.MjModel.from_xml_path(str(ROOT / 'caryam_world.xml'))
-data = mujoco.MjData(model)
-
-
-def robot_joint_ids(prefix):
-    joint_ids = set()
-    for body_id in range(model.nbody):
-        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
-        if not body_name or not body_name.startswith(prefix):
-            continue
-        first_joint = int(model.body_jntadr[body_id])
-        joint_count = int(model.body_jntnum[body_id])
-        joint_ids.update(range(first_joint, first_joint + joint_count))
-    return sorted(joint_ids)
-
-
-def joint_qpos_width(joint_id):
-    start = int(model.jnt_qposadr[joint_id])
-    end = int(model.jnt_qposadr[joint_id + 1]) if joint_id + 1 < model.njnt else model.nq
-    return start, end
-
-
-def multiply_quaternions(left, right):
-    lw, lx, ly, lz = left
-    rw, rx, ry, rz = right
-    return (
-        lw * rw - lx * rx - ly * ry - lz * rz,
-        lw * rx + lx * rw + ly * rz - lz * ry,
-        lw * ry - lx * rz + ly * rw + lz * rx,
-        lw * rz + lx * ry - ly * rx + lz * rw,
-    )
-
-
-for robot in manifest["robots"]:
-    prefix = robot["prefix"]
-    joint_ids = robot_joint_ids(prefix)
-    home_key = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, prefix + "home")
-    if home_key >= 0:
-        for joint_id in joint_ids:
-            start, end = joint_qpos_width(joint_id)
-            data.qpos[start:end] = model.key_qpos[home_key, start:end]
-    for joint_name, value in robot["qpos"].items():
-        full_name = prefix + joint_name
-        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, full_name)
-        if joint_id < 0:
-            continue
-        qpos_address = int(model.jnt_qposadr[joint_id])
-        if int(model.jnt_type[joint_id]) in {2, 3}:
-            data.qpos[qpos_address] = float(value)
-    if robot.get("free_base"):
-        free_joint = next(
-            (joint_id for joint_id in joint_ids if int(model.jnt_type[joint_id]) == int(mujoco.mjtJoint.mjJNT_FREE)),
-            -1,
-        )
-        if free_joint >= 0:
-            qpos_address = int(model.jnt_qposadr[free_joint])
-            rotation = robot["quaternion"]
-            inverse_rotation = (rotation[0], -rotation[1], -rotation[2], -rotation[3])
-            local_position = (0.0, *data.qpos[qpos_address:qpos_address + 3])
-            rotated_position = multiply_quaternions(
-                multiply_quaternions(rotation, local_position), inverse_rotation,
-            )
-            for index, value in enumerate(robot["position"]):
-                data.qpos[qpos_address + index] = rotated_position[index + 1] + float(value)
-            orientation = multiply_quaternions(rotation, data.qpos[qpos_address + 3:qpos_address + 7])
-            data.qpos[qpos_address + 3:qpos_address + 7] = orientation
-
-mujoco.mj_forward(model, data)
+from runpy import run_path
+initialize = run_path(str(ROOT / "caryam_physics_runtime.py"))["initialize"]
+data = initialize(mujoco, model, manifest)
 
 for robot in manifest["robots"]:
     for mount in robot.get("sensors", []):

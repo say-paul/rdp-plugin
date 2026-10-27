@@ -5,12 +5,13 @@ from __future__ import annotations
 import ast
 import json
 import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 import xml.etree.ElementTree as ElementTree
 
-from .sensor_spec import SensorDefinition
+from .sensor_spec import SensorDefinition, _sensors
 
 
 MODEL_KEYS = (
@@ -280,25 +281,30 @@ def discover_robot_definitions(setup_path: str | Path) -> list[RobotDefinition]:
     return unique
 
 
+class SensorCatalogWarning(UserWarning):
+    """A sensor source contains unreadable or unsupported definitions."""
+
+
 def discover_sensor_definitions(setup_path: str | Path) -> list[SensorDefinition]:
-    """Read a sensor menagerie's root registry, returning no entries if absent."""
+    """Adapt an external sensor catalog to Caryam's graph contracts."""
     path = Path(setup_path).expanduser().resolve()
-    registry = path if path.is_file() and path.name == "registry.json" else path / "registry.json"
+    registry = path if path.is_file() and path.suffix == ".json" else path / "registry.json"
     if not registry.is_file():
         return []
     try:
         value = json.loads(registry.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        value = None
+    if isinstance(value, dict) and "sensors" not in value:
         return []
-    sensors = value.get("sensors") if isinstance(value, dict) else None
-    if not isinstance(sensors, dict):
-        return []
-    result: list[SensorDefinition] = []
-    for sensor_id, entry in sorted(sensors.items()):
-        if not isinstance(entry, dict):
-            continue
-        try:
-            result.append(SensorDefinition.from_dict(str(sensor_id), entry, str(registry)))
-        except (ValueError, TypeError, KeyError):
-            continue
-    return result
+    catalog = _sensors.load_catalog(registry)
+    for diagnostic in catalog.diagnostics:
+        warnings.warn(
+            f"{registry} [{diagnostic.sensor_id or 'registry'}]: {diagnostic.message}",
+            SensorCatalogWarning,
+            stacklevel=2,
+        )
+    return [
+        SensorDefinition.from_dict(sensor.sensor_id, sensor.to_dict(), str(sensor.source_path))
+        for sensor in sorted(catalog.sensors, key=lambda entry: entry.sensor_id)
+    ]

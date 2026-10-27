@@ -48,7 +48,11 @@ def export_request(payload: dict[str, Any]) -> tuple[Path, Path, Path]:
         mesh = _vectors(value, "position", "quaternion", "scale", "rgba")
         mesh["mount"] = _mount(value["mount"])
         meshes.append(SceneMeshInstance(**mesh))
-    return write_world_export(payload["output_path"], robots, meshes, world_options=WorldOptions(**payload.get("world_options", {})))
+    sensors = tuple(_sensor_mount(mount) for mount in payload.get("scene_sensors", []))
+    return write_world_export(
+        payload["output_path"], robots, meshes, world_options=WorldOptions(**payload.get("world_options", {})),
+        scene_sensors=sensors,
+    )
 
 
 def main() -> int:

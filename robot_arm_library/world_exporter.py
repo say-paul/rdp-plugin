@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import json
 import math
-import os
 import re
 import site
 import subprocess
@@ -16,8 +15,9 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
-from .sensor_compilers.mujoco import compile_depth_camera, compile_lidar
-from .sensor_spec import CameraSensorSpec, LidarSensorSpec, SensorDefinition
+from .external_python import worker_environment
+from .sensor_compilers.mujoco import compile_camera, compile_imu, compile_lidar
+from .sensor_spec import CAMERA_CATEGORIES, CameraSensorSpec, LidarSensorSpec, SensorDefinition
 
 
 _PRIMITIVE_COLLISION_TYPES = {"BOX": "box", "SPHERE": "sphere", "CAPSULE": "capsule", "CYLINDER": "cylinder"}
@@ -59,6 +59,7 @@ class SensorMount:
     position: tuple[float, float, float]
     quaternion: tuple[float, float, float, float]
     body_name: str = ""
+    object_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,47 @@ class SceneMeshInstance:
     def asset_name(self) -> str:
         value = re.sub(r"[^A-Za-z0-9_]", "_", self.instance_id).strip("_")
         return "scene_" + (value or "mesh")
+
+
+def _sensor_content(definition: SensorDefinition, name: str) -> tuple[list[ElementTree.Element], list[ElementTree.Element]]:
+    if definition.category == "lidar":
+        return compile_lidar(definition.lidar or LidarSensorSpec(), name)
+    if definition.category == "imu":
+        site, measurements = compile_imu(name)
+        return [site], measurements
+    if definition.category in CAMERA_CATEGORIES:
+        return [compile_camera(definition.camera or CameraSensorSpec(), name)], []
+    raise ValueError(f"Unsupported sensor category: {definition.category}")
+
+
+def _add_scene_sensors(tree: ElementTree.ElementTree, mounts: Iterable[SensorMount]) -> ElementTree.ElementTree:
+    root = tree.getroot()
+    if root is None:
+        raise ValueError("The MuJoCo world has no root for scene sensors")
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise ValueError("The MuJoCo world has no worldbody for scene sensors")
+    names = {body.get("name") for body in root.iter("body")}
+    section = root.find("sensor")
+    for mount in mounts:
+        if not mount.mount_name or mount.mount_name in names:
+            raise ValueError(f"Duplicate or empty scene sensor name: {mount.mount_name}")
+        names.add(mount.mount_name)
+        target = worldbody
+        if mount.body_name:
+            target = next((body for body in worldbody.iter("body") if body.get("name") == mount.body_name), None)
+            if target is None:
+                raise ValueError(f"Missing scene sensor parent body: {mount.body_name}")
+        body = ElementTree.SubElement(target, "body", {
+            "name": mount.mount_name, "pos": _format_values(mount.position), "quat": _format_values(mount.quaternion),
+        })
+        elements, measurements = _sensor_content(mount.sensor, mount.mount_name)
+        body.extend(elements)
+        if measurements:
+            if section is None:
+                section = ElementTree.SubElement(root, "sensor")
+            section.extend(measurements)
+    return tree
 
 
 def _format_values(values: Iterable[float]) -> str:
@@ -198,14 +240,12 @@ def _write_sensorized_model(output_path: Path, instance: RobotInstance) -> Path:
             "pos": _format_values(mount.position),
             "quat": _format_values(mount.quaternion),
         })
-        if mount.sensor.category == "lidar":
-            sites, rangefinders = compile_lidar(mount.sensor.lidar or LidarSensorSpec(), mount.mount_name)
-            mount_body.extend(sites)
+        elements, measurements = _sensor_content(mount.sensor, mount.mount_name)
+        mount_body.extend(elements)
+        if measurements:
             if existing_sensor_section is None:
                 existing_sensor_section = ElementTree.SubElement(root, "sensor")
-            existing_sensor_section.extend(rangefinders)
-        elif mount.sensor.category == "depth_camera":
-            mount_body.append(compile_depth_camera(mount.sensor.camera or CameraSensorSpec(), mount.mount_name))
+            existing_sensor_section.extend(measurements)
     generated = _sensorized_model_path(output_path, instance)
     generated.parent.mkdir(parents=True, exist_ok=True)
     ElementTree.indent(tree, space="  ")
@@ -218,6 +258,7 @@ def build_world_xml(
     output_path: str | Path,
     scene_meshes: Iterable[SceneMeshInstance] = (),
     *, world_options: WorldOptions | None = None,
+    scene_sensors: Iterable[SensorMount] = (),
 ) -> ElementTree.ElementTree:
     """Build a MuJoCo 3.2+ world using ``asset/model`` and ``attach``."""
     output = Path(output_path).expanduser().resolve()
@@ -226,12 +267,15 @@ def build_world_xml(
     if any(instance.mount is not None for instance in instance_list) or any(mesh.mount is not None for mesh in scene_mesh_list):
         tree = _build_mounted_world(instance_list, output, scene_mesh_list)
         options = world_options or WorldOptions()
-        option = tree.getroot().find("option")
+        mounted_root = tree.getroot()
+        if mounted_root is None:
+            raise ValueError("The mounted MuJoCo world has no root")
+        option = mounted_root.find("option")
         if option is None:
-            option = ElementTree.SubElement(tree.getroot(), "option")
+            option = ElementTree.SubElement(mounted_root, "option")
         option.set("timestep", str(options.timestep))
         option.set("gravity", " ".join(format(value, ".15g") for value in options.gravity))
-        return tree
+        return _add_scene_sensors(tree, scene_sensors)
     options = world_options or WorldOptions()
     root = ElementTree.Element("mujoco", {"model": "caryam_world"})
     ElementTree.SubElement(root, "compiler", {"autolimits": "true"})
@@ -321,12 +365,9 @@ def build_world_xml(
                     "quat": _format_values(mount.quaternion),
                 },
             )
-            if mount.sensor.category == "lidar":
-                sites, rangefinders = compile_lidar(mount.sensor.lidar or LidarSensorSpec(), mount_name)
-                mount_body.extend(sites)
-                sensor_elements.extend(rangefinders)
-            elif mount.sensor.category == "depth_camera":
-                mount_body.append(compile_depth_camera(mount.sensor.camera or CameraSensorSpec(), mount_name))
+            elements, measurements = _sensor_content(mount.sensor, mount_name)
+            mount_body.extend(elements)
+            sensor_elements.extend(measurements)
 
     seen_scene_ids: set[str] = set()
     for scene_mesh in scene_mesh_list:
@@ -399,7 +440,7 @@ def build_world_xml(
     if sensor_elements:
         sensors = ElementTree.SubElement(root, "sensor")
         sensors.extend(sensor_elements)
-    return ElementTree.ElementTree(root)
+    return _add_scene_sensors(ElementTree.ElementTree(root), scene_sensors)
 
 
 def _mount_order(
@@ -516,15 +557,13 @@ def _add_root_sensors(spec, instance: RobotInstance, mujoco):
             "name": mount.mount_name, "pos": _format_values(mount.position),
             "quat": _format_values(mount.quaternion),
         })
-        if mount.sensor.category == "lidar":
-            sites, sensors = compile_lidar(mount.sensor.lidar or LidarSensorSpec(), mount.mount_name)
-            body.extend(sites)
+        elements, measurements = _sensor_content(mount.sensor, mount.mount_name)
+        body.extend(elements)
+        if measurements:
             section = root.find("sensor")
             if section is None:
                 section = ElementTree.SubElement(root, "sensor")
-            section.extend(sensors)
-        elif mount.sensor.category == "depth_camera":
-            body.append(compile_depth_camera(mount.sensor.camera or CameraSensorSpec(), mount.mount_name))
+            section.extend(measurements)
     return mujoco.MjSpec.from_string(ElementTree.tostring(root, encoding="unicode"))
 
 
@@ -607,6 +646,14 @@ def _build_mounted_world(
     return ElementTree.ElementTree(root)
 
 
+def _sensor_manifest_value(mount):
+    return {
+        "mount_name": mount.mount_name, "object_name": mount.object_name,
+        "position": list(mount.position), "quaternion": list(mount.quaternion),
+        "body_name": mount.body_name, "sensor": mount.sensor.to_dict(),
+    }
+
+
 def _manifest_value(instance: RobotInstance) -> dict[str, object]:
     value = asdict(instance)
     value["position"] = list(instance.position)
@@ -655,9 +702,11 @@ from runpy import run_path
 initialize = run_path(str(ROOT / "caryam_physics_runtime.py"))["initialize"]
 data = initialize(mujoco, model, manifest)
 
-for robot in manifest["robots"]:
-    for mount in robot.get("sensors", []):
-        mount_name = robot["prefix"] + mount["mount_name"]
+sensor_groups = [(robot["prefix"], robot.get("sensors", [])) for robot in manifest["robots"]]
+sensor_groups.append(("", manifest.get("sensors", [])))
+for prefix, mounts in sensor_groups:
+    for mount in mounts:
+        mount_name = prefix + mount["mount_name"]
         definition = mount["sensor"]
         if definition["category"] == "lidar":
             spec = definition.get("lidar") or {{}}
@@ -676,6 +725,13 @@ for robot in manifest["robots"]:
                         row.append(float(data.sensordata[int(model.sensor_adr[sensor_id])]))
                 readings.append(row)
             print(f"{{mount_name}} lidar scan: {{readings[0] if channels == 1 else readings}}")
+        elif definition["category"] == "imu":
+            for suffix, unit in (("accelerometer", "m/s^2"), ("gyroscope", "rad/s")):
+                sensor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, f"{{mount_name}}_{{suffix}}")
+                if sensor_id >= 0:
+                    address = int(model.sensor_adr[sensor_id])
+                    values = data.sensordata[address:address + 3].tolist()
+                    print(f"{{mount_name}} {{suffix}} ({{unit}}, site axes): {{values}}")
         elif definition["category"] == "depth_camera":
             camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, mount_name)
             if camera_id < 0:
@@ -727,6 +783,7 @@ def _write_world_export_local(
     instances: Iterable[RobotInstance],
     scene_meshes: Iterable[SceneMeshInstance] = (),
     *, world_options: WorldOptions | None = None,
+    scene_sensors: Iterable[SensorMount] = (),
 ) -> tuple[Path, Path, Path]:
     """Write a world using the current interpreter's available MuJoCo backend."""
     output = Path(output_path).expanduser().resolve()
@@ -736,7 +793,8 @@ def _write_world_export_local(
     for instance in instance_list:
         if any(mount.body_name for mount in instance.sensors):
             _write_sensorized_model(output, instance)
-    world_tree = build_world_xml(instance_list, output, scene_mesh_list, world_options=world_options)
+    sensor_list = list(scene_sensors)
+    world_tree = build_world_xml(instance_list, output, scene_mesh_list, world_options=world_options, scene_sensors=sensor_list)
     ElementTree.indent(world_tree, space="  ")
     world_tree.write(output, encoding="utf-8", xml_declaration=True)
 
@@ -749,6 +807,7 @@ def _write_world_export_local(
                 "world_options": asdict(world_options or WorldOptions()),
                 "robots": [_manifest_value(instance) for instance in instance_list],
                 "scene_meshes": [_scene_mesh_manifest_value(instance) for instance in scene_mesh_list],
+                "sensors": [_sensor_manifest_value(mount) for mount in sensor_list],
             },
             indent=2,
         )
@@ -765,19 +824,18 @@ def _write_world_export_local(
 def _write_world_export_external(
     output: Path, instances: list[RobotInstance], scene_meshes: list[SceneMeshInstance], executable: str,
     world_options: WorldOptions | None = None,
+    scene_sensors: Iterable[SensorMount] = (),
 ) -> tuple[Path, Path, Path]:
     robots = [asdict(instance) for instance in instances]
     meshes = [asdict(mesh) for mesh in scene_meshes]
     for value in (*robots, *meshes):
         value["source_path"] = str(Path(value["source_path"]).expanduser().resolve())
     payload = {"version": 1, "output_path": str(output), "robots": robots, "scene_meshes": meshes,
+               "scene_sensors": [asdict(mount) for mount in scene_sensors],
                "world_options": asdict(world_options or WorldOptions())}
-    env = os.environ.copy()
-    package_parent = str(Path(__file__).resolve().parent.parent)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, (package_parent, env.get("PYTHONPATH", ""))))
-    env.pop("PYTHONHOME", None)
     guidance = f"Check the Python executable selected in Sim > MuJoCo > Python: {executable}"
     with tempfile.TemporaryDirectory(prefix="caryam-export-") as directory:
+        env = worker_environment(Path(directory))
         request = Path(directory) / "request.json"
         request.write_text(json.dumps(payload), encoding="utf-8")
         try:
@@ -809,14 +867,16 @@ def write_world_export(
     *,
     python_executable: str | None = None,
     world_options: WorldOptions | None = None,
+    scene_sensors: Iterable[SensorMount] = (),
 ) -> tuple[Path, Path, Path]:
     """Export locally, or use the selected Python if its MuJoCo backend is needed."""
     output = Path(output_path).expanduser().resolve()
     instance_list = list(instances)
     scene_mesh_list = list(scene_meshes)
+    sensor_list = list(scene_sensors)
     try:
-        return _write_world_export_local(output, instance_list, scene_mesh_list, world_options=world_options)
+        return _write_world_export_local(output, instance_list, scene_mesh_list, world_options=world_options, scene_sensors=sensor_list)
     except MuJoCoBackendUnavailable:
         if python_executable is None:
             raise
-        return _write_world_export_external(output, instance_list, scene_mesh_list, python_executable, world_options)
+        return _write_world_export_external(output, instance_list, scene_mesh_list, python_executable, world_options, sensor_list)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import deque
 import json
-import os
 from pathlib import Path
 import queue
 import shutil
@@ -14,6 +13,7 @@ import threading
 import time
 import uuid
 
+from ..external_python import worker_environment
 from .protocol import COMMANDS, MAX_MESSAGE, VERSION, decode, encode
 
 
@@ -51,10 +51,7 @@ class SimulationClient:
                    "servo_options": request.pop("servo_options", {})}
         request_path = self.directory / "request.json"
         request_path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
-        env = os.environ.copy()
-        parent = str(Path(__file__).resolve().parents[2])
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, (parent, env.get("PYTHONPATH", ""))))
-        env.pop("PYTHONHOME", None)
+        env = worker_environment(self.directory)
         self._started = time.monotonic()
         self.process = subprocess.Popen([self.executable, "-u", "-m", "robot_arm_library.physics.worker", str(request_path)],
                                         cwd=str(self.directory), env=env, stdin=subprocess.PIPE,

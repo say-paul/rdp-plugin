@@ -1,8 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "caryam-robot-arm-library"
 version = "0.1.0"
 description = "Blender add-on for discovering and placing Robot Library"
 requires-python = ">=3.10"
+dependencies = ["mujoco-sensor-library>=0.1.1,<0.2"]
 
 [project.scripts]
 caryam-core-bridge = "robot_arm_library.core_bridge:main"
@@ -14,3 +19,9 @@ pythonpath = ["."]
 
 [project.optional-dependencies]
 mujoco = ["mujoco>=3.2"]
+
+[tool.setuptools.packages.find]
+include = ["robot_arm_library*"]
+
+[tool.setuptools.package-data]
+robot_arm_library = ["*.json"]

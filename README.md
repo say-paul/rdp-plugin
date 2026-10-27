@@ -4,13 +4,41 @@ This Blender add-on discovers robot arms from a `deep_mind/mujoco_manager/robot_
 
 ## Install
 
-Create the Blender add-on archive from the repository root:
+### Automatic installation
+
+Keep the separate sensor project alongside this repository at `../mujoco_sensor_library` (for this checkout, `~/git_repos/mujoco_sensor_library`). It is not stored inside Caryam. From the Caryam repository root:
+
+```bash
+make install
+```
+
+This installs the independent sensor distribution into Blender's user `scripts/modules` directory, installs/enables the Robot Library add-on, verifies that it loaded, and saves preferences. The sensor package remains outside the add-on; no `PYTHONPATH` launch command is needed. Restart already-open Blender windows, then press **N** in a 3D View and select **Robot Library**. The sensor panel is inside that tab, not a second add-on.
+
+The installer uses `.venv/bin/python` when available, otherwise `python3`; that Python needs pip. Select different executables when needed:
+
+```bash
+make install BLENDER=/path/to/blender PYTHON=/path/to/python SENSOR_LIBRARY=/path/to/mujoco_sensor_library
+```
+
+Use the same Blender installation that you launch from the desktop. Installation failures now make the command fail rather than reporting a broken add-on as enabled. Live-physics and external-export workers receive the standalone pure-Python sensor package through a temporary isolated import directory (a link, or a copy when links are unavailable). Blender's native site-packages are not forwarded. The selected external Python still needs its own compatible MuJoCo installation; direct standalone package use requires installation as described below.
+
+### Manual installation
+
+Install the independent [MuJoCo Sensor Library](../mujoco_sensor_library/README.md) first, using the Python environment used for simulation:
+
+```bash
+python -m pip install -e ../mujoco_sensor_library
+```
+
+Install the same independent project for **Blender's Python version** as well, if it uses a different environment. For example, run its bundled Python executable with `-m pip install --user /absolute/path/to/mujoco_sensor_library`. The add-on checks that interpreter's user-site directory. Installing into an unrelated virtual environment does not make the package available to Blender.
+
+Then create the Blender add-on archive from the repository root:
 
 ```bash
 make zip
 ```
 
-This creates `robot_arm_library.zip` for the Blender installation steps below.
+This creates `robot_arm_library.zip` for the Blender installation steps below. The sensor library remains a separate Python distribution; it is not copied into the add-on ZIP.
 
 1. In Blender, open **Edit > Preferences > Add-ons > Install**.
 2. Select `robot_arm_library.zip` from this repository.
@@ -32,7 +60,9 @@ Set **Setup** to the cloned `mujoco_menagerie` folder and click refresh. Selecti
 
 ### Multiple asset sources and virtual sensors
 
-The **Robot Library** tab keeps **Setup** as its primary source. Use **Additional Asset Sources → Add Source** to register other robot or sensor repositories, choose `Auto`, `Robot`, or `Sensor`, then refresh. The **Sensor Library** panel lists discovered sensors. A sensor repository needs a `registry.json` at its root:
+The **Robot Library** tab keeps **Setup** as its primary source. The **MuJoCo Sensor Library** panel automatically loads the installed independent library's generic RGB, depth, RGB-D, 2D lidar and six-axis IMU presets when refreshed. This panel is a preset catalog only; added sensor instances are ordinary scene objects shown in the Outliner, not listed under the catalog. Definitions, validation, presets and MJCF compilation live in the separate [mujoco_sensor_library](../mujoco_sensor_library/README.md) project, which can be installed or used without Blender, ROS or the MuJoCo Python bindings.
+
+Use **Additional Asset Sources → Add Source** to register other robot or sensor repositories, choose `Auto`, `Robot`, or `Sensor`, then refresh. External entries remain separate from the default presets. A sensor repository needs a `registry.json` at its root (versionless legacy registries are still accepted):
 
 ```json
 {
@@ -53,7 +83,23 @@ The **Robot Library** tab keeps **Setup** as its primary source. Use **Additiona
 }
 ```
 
-Create your own repository with this convention, then register its path as a `Sensor` source. Select an imported robot body and press **Attach to Selected Body**. The new sensor empty starts at that body's origin; move or rotate it to set its mount pose. The mount stores a copy of the definition in the Blender scene. On export, Caryam writes a sensorized MJCF copy beside the world XML, adds rangefinder sites or a depth camera under the selected body, and records the mount in `world.json`. The generated `render_world.py` prints lidar readings and saves depth frames as `.npy` files when MuJoCo renders the world. The sensor definition is simulator-independent; this release includes the MuJoCo compiler for lidar and depth cameras.
+Create your own repository with this convention, then register its path as a `Sensor` source. Invalid entries produce diagnostics in the sensor panel while valid entries remain available. Select a preset and press **Add Sensor to Scene**. The sensor is created in the Scene Collection at the 3D cursor's position/orientation, with no robot or parent required. Move/rotate it normally. Each object stores a copy of the definition, so refreshing a catalog does not alter saved sensor instances.
+
+Select the sensor in the viewport or Outliner and open **Object Properties → MuJoCo Sensor** for its instance settings. Choose a **Mount Target** (robot link or exported scene mesh), then **Attach Sensor (Keep World Pose)**. Attachment keeps the sensor where it is; edit its local Offset/Rotation afterward if needed. **Detach Sensor (Keep World Pose)** makes it independent again without moving it. The sensor remains in its scene collection. Targets that would create parenting cycles are rejected; apply nonuniform target scale first if preserving the pose would require shear. Existing attached sensors and the legacy attach operator remain supported.
+
+**Magnetic sensor mounting:** in **Robot Library → Snap & Mount**, choose **Add Magnetic Point** and click the sensor housing to create its moving point. Add another magnetic point on the destination robot link or exported scene mesh. Select the sensor's point, put the pointer in the 3D viewport, and press **Ctrl+Shift+M** (or choose **Magnetic Move**). The moving point follows the cursor without a sidebar-induced offset. Move near the target (within **Snap Distance**) and click to place; **Esc** restores the original mount/pose. Only the sensor moves, even if it was already attached to a robot. **Detach Mount** or the sensor's **Detach Sensor (Keep World Pose)** releases it. Sensor housings remain viewport-only: magnetic points do not add mass or collision geometry.
+
+**Nearest Axes** is the default magnetic alignment: the moving point's local +Z aligns to the nearest signed X/Y/Z axis of the destination point, and the remaining axes align using the nearest 90° twist. This uses the destination's frame, not world axes. For deterministic placement, select the destination magnetic point and set **Destination Axis** to +X/-X, +Y/-Y or +Z/-Z instead of **Automatic (Nearest)**. **Face to Face**, **Match Frames** and **Position Only** remain available; existing saved alignment choices are preserved. Use **Face to Face** or a suitable explicit destination axis when mounting surface normals must oppose.
+
+**Mount visualization:** cameras use a generic camera-bar housing with visible lens(es); lidar uses a generic puck housing; IMUs use a small PCB/chip module. Only these housings are mesh geometry and accept magnetic points. Axes, origin/aim markers and field-of-view guides are non-selectable viewport overlays, not scene objects or mount surfaces. Open the **Viewport Overlays** popover → **Caryam Sensors** to toggle **Axes / Origin**, **Aim Direction** and **Field of View** independently. Turning off **Show Overlays** or **Extras** in a viewport hides all sensor guides while keeping the housings visible. Sensor names follow Blender's native text/overlay controls. Camera frustums and lidar coverage are drawn as wire lines, never solid cones. Existing saved previews are upgraded shortly after the add-on is enabled, or when the file is opened, preserving sensor transforms, definitions and magnetic points. The enable-time upgrade is deferred until Blender leaves its restricted registration phase.
+
+These are illustrative shapes, not accurate replicas of a commercial module, and add no simulated mass or collision geometry. The yellow origin marker is the exported sensor origin; the yellow arrow shows camera/lidar sensing direction. Red/green/blue arrows show local +X/+Y/+Z, including the IMU's measurement frame. Cameras look along **-Z** with **+Y up**; planar lidar scans in **XY**, with **+X forward**. Camera frustums match the definition's vertical FOV and render aspect. Lidar guides show the scan coverage. Guides are only 0.2 m long for placement, not the sensor's actual range; IMUs have no field-of-view guide.
+
+The **Object Properties → MuJoCo Sensor** panel shows the parent **Link** (or fixed-world state), editable **Offset/Rotation**, and optional **X-Ray Preview** setting. Housings and guides obey normal viewport depth/occlusion by default, so robot geometry correctly hides a camera mounted behind it as you orbit. X-Ray Preview is a visualization aid only, not a physics or camera-pose setting. Older previews that forced X-ray on are migrated to normal visibility on add-on reload/file open; intentional X-ray choices made afterward survive preview refreshes. For sensors already stored as sphere empties, select the sensor in the Outliner and click **Add / Update Module Shape** there. This preserves its saved definition, parent, pose and object identity. Stop live physics before adding, attaching/detaching or changing sensor geometry/pose; preview geometry is excluded from MuJoCo export.
+
+On export, Caryam calls the independent library's compiler to write rangefinders, cameras or IMU sites/measurements into the MuJoCo world and records each mount in `world.json`; source robot models remain unchanged. Unparented sensors (including those parented only to ordinary scene empties) are fixed at their exported world pose. Sensors on robot links follow those links; sensors on exported scene meshes follow the corresponding MuJoCo body. Independent/scene-body instances are stored in the manifest's additive top-level `sensors` list; legacy per-robot sensors remain readable. Camera categories are `rgb_camera`, `depth_camera`, and `rgbd_camera`, with explicit category-defined outputs. A legacy depth camera does not implicitly become RGB-D. Full-circle lidar samples are half-open, without a duplicated endpoint.
+
+**This step delivers the library, scene authoring and MJCF export, not sensor-stream acquisition or ROS publishing.** IMU compilation creates native MuJoCo accelerometer and gyro sensors: local-site-axis specific force in m/s² and angular velocity in rad/s, with no estimated orientation. The generated `render_world.py` prints one-shot IMU/lidar readings and saves a one-shot depth-camera frame before opening its viewer; it does not yet acquire RGB/RGB-D output. Native IMU values update with the solver, but Caryam does not yet stream them to a UI/ROS node. On tested MuJoCo 3.14, an IMU welded directly to the world reports native zero readings; a supported non-world-welded dynamic body at rest measures gravity-inclusive specific force, and freefall measures zero. Sample-rate metadata does not schedule acquisition, and camera clipping/resolution metadata still requires a future runtime to configure rendering and validate measurements.
 
 Each item has two placement modes:
 
@@ -69,6 +115,10 @@ For authoritative scale and joint placement, install MuJoCo 3.2 or newer for the
 ```bash
 python -m pip install --user "mujoco>=3.2"
 ```
+
+## Project files outside the source checkout
+
+Keep Blender scenes, backups, textures and generated exports in a separate project directory (for example, `../caryam_blender_project`), not in this source repository. Open Blender from that directory and save the `.blend` there; default world exports are written beside the saved scene. Keep the scene's relative asset folders together when relocating it. Add-on source code and its installation archive stay in this repository.
 
 ## Export and render a world
 
@@ -122,6 +172,8 @@ Use the **Joint Controller** and **Joint Target** nodes to model a simulation co
 
 Open **Robot Control → ROS Control** to choose ROS 1 or ROS 2, list topics, echo one message, publish one message, or launch RViz. The controls use the installed `rostopic`/`ros2` and `rviz`/`rviz2` command-line tools. The add-on registers without ROS installed and reports a command error when a tool is missing.
 
+For the proposed live ROS 2 bridge, joint trajectory control, and reusable virtual Sensor Library, see the [implementation plan](docs/superpowers/plans/2026-10-27-ros2-control-and-sensor-library.md). These live ROS 2 features are not yet implemented.
+
 ## Robot Build
 
 Open the **Robot Build** sidebar tab to set an OCI image name and bootc base image. **Generate Containerfile** writes `build/Containerfile` and a small entrypoint payload beside the current `.blend` file. **Build Image** starts `podman build` (or Docker when selected) in the background. The status shows the launched command's intent; inspect the tool's output to confirm completion. Set the exact `/dev/...` disk and use **Flash to Disk** to open a confirmation dialog before the bootc install command runs. This erases the selected disk. The command follows the [bootc installation instructions](https://bootc.dev/bootc/bootc-installation.7.html).
@@ -171,4 +223,4 @@ To test a real Menagerie import, run:
 blender --background --factory-startup --python tests/blender_import_test.py
 ```
 
-The feature smoke scripts are `tests/blender_flow_yaml_io_test.py`, `tests/blender_ros_bridge_test.py`, `tests/blender_container_build_test.py`, `tests/blender_multi_source_test.py`, and `tests/blender_sensor_attach_test.py`. Run each with the same `blender --background --factory-startup --python` command.
+The feature smoke scripts are `tests/blender_flow_yaml_io_test.py`, `tests/blender_ros_bridge_test.py`, `tests/blender_container_build_test.py`, `tests/blender_multi_source_test.py`, `tests/blender_sensor_attach_test.py`, `tests/blender_sensor_magnetic_test.py`, `tests/blender_sensor_depth_test.py`, `tests/blender_magnetic_alignment_test.py`, `tests/blender_addon_enable_test.py`, and `tests/blender_sensor_overlay_test.py`. Run each with the same `blender --background --factory-startup --python` command. The graphical overlay regression runs without `--background`: `blender --factory-startup --no-window-focus --python-exit-code 1 --python tests/blender_sensor_overlay_gui_test.py`; it checks rendered guides, overlay visibility and housing visibility, then closes its own window. The depth/occlusion regression runs as `blender --factory-startup --no-window-focus --python-exit-code 1 --python tests/blender_sensor_depth_gui_test.py` and compares opposite views plus opt-in X-ray for modern/legacy sensors. The graphical shortcut regression uses `blender --factory-startup --no-window-focus --enable-event-simulate --python-exit-code 1 --python tests/blender_magnetic_shortcut_gui_test.py` to exercise the actual Ctrl+Shift+M binding, snapping and Esc cancellation.

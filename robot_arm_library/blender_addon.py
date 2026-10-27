@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 import json
+import re
 import shutil
 import subprocess
 import urllib.error
 import urllib.request
+import warnings
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -22,9 +24,10 @@ from .asset_sources import AssetSource, discover_from_sources
 from .behavior_graph import BehaviorGraph, BehaviorLink, BehaviorNode, PortSpec
 from .container_builder import DEFAULT_BASE_IMAGE
 from .port_catalog import catalog_node_template
-from . import mounting
+from . import mounting, sensor_visuals
 from .physics import blender as live_physics
-from .setup_parser import discover_sensor_definitions
+from .sensor_spec import CAMERA_CATEGORIES, _sensors
+from .setup_parser import SensorCatalogWarning, discover_sensor_definitions
 from .world_exporter import RobotInstance, SceneMeshInstance, SensorMount, WorldOptions, write_world_export
 
 
@@ -627,12 +630,21 @@ def _refresh_libraries(scene: bpy.types.Scene) -> None:
         if item.path.strip():
             extra_path = Path(bpy.path.abspath(item.path)).expanduser().resolve()
             sources.append(AssetSource(str(extra_path), item.kind, item.label or item.path, item.enabled))
+    sources.append(AssetSource(str(_sensors.default_catalog_path()), "sensor", "MuJoCo Sensor Library"))
     scene.robot_library.clear()
     scene.sensor_library.clear()
+    scene.sensor_library_status = ""
     try:
-        definitions, sensors = discover_from_sources(sources)
+        with warnings.catch_warnings(record=True) as source_warnings:
+            warnings.simplefilter("always", SensorCatalogWarning)
+            definitions, sensors = discover_from_sources(sources)
+        scene.sensor_library_status = "\n".join(
+            str(item.message) for item in source_warnings
+            if issubclass(item.category, SensorCatalogWarning)
+        )
     except Exception as error:
         scene.robot_library_status = f"Cannot read setup: {error}"
+        scene.sensor_library_status = str(error)
         return
 
     for definition in definitions:
@@ -982,34 +994,23 @@ def _world_robot_instances() -> list[RobotInstance]:
     return instances
 
 
+def _sensor_definition(obj):
+    return sensor_visuals.sensor_definition(obj)
+
+
 def _sensor_mounts(root: bpy.types.Object) -> list[SensorMount]:
     mounts: list[SensorMount] = []
     for obj in sorted(bpy.context.scene.objects, key=lambda item: item.name):
         if not obj.get("sensor_id"):
             continue
-        if _selected_robot_root(obj) is not root:
+        if mounting.robot_root(obj) is not root:
             continue
-        source_path = str(obj.get("sensor_source_path", ""))
-        payload = str(obj.get("sensor_definition_json", ""))
         try:
-            if payload:
-                from .sensor_spec import SensorDefinition
-                definition = SensorDefinition.from_dict(str(obj["sensor_id"]), json.loads(payload), source_path)
-            else:
-                definition = next(
-                    sensor for sensor in discover_sensor_definitions(source_path)
-                    if sensor.sensor_id == str(obj["sensor_id"])
-                )
+            definition = _sensor_definition(obj)
         except (OSError, ValueError, StopIteration, TypeError):
             continue
-        parent_body = obj.parent
-        while (
-            parent_body is not None and parent_body is not root
-            and "mujoco_body_id" not in parent_body and not parent_body.name.startswith("Body: ")
-        ):
-            parent_body = parent_body.parent
-        body_name = str(parent_body.get("mujoco_body_name", parent_body.name.removeprefix("Body: "))) if parent_body is not None and parent_body is not root else ""
-        frame = parent_body if parent_body is not None else root
+        frame = sensor_visuals.mount_frame(obj, root)
+        body_name = str(frame.get("mujoco_body_name", frame.name.removeprefix("Body: "))) if frame is not root else ""
         local_matrix = frame.matrix_world.inverted() @ obj.matrix_world
         mounts.append(SensorMount(
             definition,
@@ -1019,6 +1020,31 @@ def _sensor_mounts(root: bpy.types.Object) -> list[SensorMount]:
             body_name,
         ))
     return mounts
+
+
+def _world_scene_sensors() -> list[SensorMount]:
+    sensors = []
+    for obj in sorted(bpy.context.scene.objects, key=lambda item: item.name):
+        if not obj.get("sensor_id") or mounting.robot_root(obj) is not None:
+            continue
+        parent = obj.parent
+        while parent is not None and parent.type != "MESH":
+            parent = parent.parent
+        body_name = ""
+        matrix = obj.matrix_world
+        if parent is not None:
+            if parent.hide_render or parent.get("sensor_id") or parent.get(sensor_visuals.PREVIEW_KEY):
+                raise ValueError(f"Sensor parent is not an exported scene body: {parent.name}")
+            parent_name = re.sub(r"[^A-Za-z0-9_]", "_", parent.name).strip("_") or "mesh"
+            body_name = "scene_" + parent_name
+            rigid = Matrix.LocRotScale(parent.matrix_world.translation, parent.matrix_world.to_quaternion(), Vector((1, 1, 1)))
+            matrix = rigid.inverted() @ matrix
+        name = "sensor_" + (re.sub(r"[^A-Za-z0-9_]", "_", obj.name).strip("_") or "sensor")
+        sensors.append(SensorMount(
+            _sensor_definition(obj), name, tuple(float(value) for value in matrix.translation),
+            tuple(float(value) for value in matrix.to_quaternion()), body_name, obj.name,
+        ))
+    return sensors
 
 
 def _is_robot_library_object(obj: bpy.types.Object) -> bool:
@@ -1081,6 +1107,7 @@ def _world_scene_meshes(output: Path) -> list[SceneMeshInstance]:
         obj
         for obj in sorted(bpy.context.scene.objects, key=lambda item: item.name)
         if obj.type == "MESH" and not obj.hide_render and not _is_robot_library_object(obj)
+        and not obj.get("sensor_id") and not obj.get(sensor_visuals.PREVIEW_KEY)
     ]
     asset_directory = output.with_name(f"{output.stem}_assets")
     scene_meshes: list[SceneMeshInstance] = []
@@ -1134,6 +1161,7 @@ def _export_world_file(filepath: str) -> tuple[Path, Path, Path]:
     exported = write_world_export(
         output, _world_robot_instances(), _world_scene_meshes(output), python_executable=executable,
         world_options=WorldOptions(gravity=tuple(scene.robot_mujoco_gravity), timestep=scene.robot_mujoco_timestep),
+        scene_sensors=_world_scene_sensors(),
     )
     _export_usd_scene(output)
     return exported
@@ -1908,6 +1936,44 @@ class ROBOT_OT_joint_window(Operator):
         return {"FINISHED"}
 
 
+def _preset_sensor(scene, index):
+    if not 0 <= index < len(scene.sensor_library):
+        raise ValueError("Select a sensor preset first")
+    item = scene.sensor_library[index]
+    definition = next((sensor for sensor in discover_sensor_definitions(item.source_path) if sensor.sensor_id == item.sensor_id), None)
+    if definition is None:
+        raise ValueError("Sensor definition is no longer available")
+    return item, definition
+
+
+def _set_sensor_definition(mount, item, definition):
+    mount["sensor_id"] = item.sensor_id
+    mount["sensor_category"] = item.category
+    mount["sensor_source_path"] = item.source_path
+    mount["sensor_definition_json"] = json.dumps(definition.to_dict())
+
+
+class ROBOT_OT_add_sensor(Operator):
+    bl_idname = "robot_library.add_sensor"
+    bl_label = "Add Sensor to Scene"
+    bl_options = {"REGISTER", "UNDO"}
+    sensor_index: IntProperty(default=-1)
+
+    def execute(self, context):
+        index = self.sensor_index if self.sensor_index >= 0 else context.scene.sensor_library_index
+        try:
+            item, definition = _preset_sensor(context.scene, index)
+        except ValueError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        mount = sensor_visuals.create_mount(context.scene.collection, f"Sensor: {item.name}", definition)
+        _set_sensor_definition(mount, item, definition)
+        mount.matrix_world = context.scene.cursor.matrix.copy()
+        _select_sensor_mount(context, mount)
+        self.report({"INFO"}, "Sensor added to scene; use Object Properties > MuJoCo Sensor to attach it later")
+        return {"FINISHED"}
+
+
 class ROBOT_OT_attach_sensor(Operator):
     bl_idname = "robot_library.attach_sensor"
     bl_label = "Attach Sensor to Body"
@@ -1941,18 +2007,142 @@ class ROBOT_OT_attach_sensor(Operator):
         if definition is None:
             self.report({"ERROR"}, "Sensor definition is no longer available")
             return {"CANCELLED"}
-        mount = bpy.data.objects.new(f"Sensor: {item.name}", None)
-        mount.empty_display_type = "SPHERE"
-        mount.empty_display_size = 0.03
+        while target is not robot_root and "mujoco_body_id" not in target and not target.name.startswith("Body: "):
+            target = target.parent
+        mount = sensor_visuals.create_mount(_robot_collection(), f"Sensor: {item.name}", definition)
         mount["sensor_id"] = item.sensor_id
         mount["sensor_category"] = item.category
         mount["sensor_source_path"] = item.source_path
         mount["sensor_definition_json"] = json.dumps(definition.to_dict())
-        _robot_collection().objects.link(mount)
         mount.parent = target
         mount.matrix_parent_inverse = Matrix.Identity(4)
         mount.location = (0.0, 0.0, 0.0)
         mount.rotation_euler = (0.0, 0.0, 0.0)
+        _select_sensor_mount(context, mount)
+        self.report({"INFO"}, f"Mounted on {target.name}; local XYZ axes show the measurement frame")
+        return {"FINISHED"}
+
+
+def _select_sensor_mount(context, mount):
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    mount.hide_set(False)
+    mount.select_set(True)
+    context.view_layer.objects.active = mount
+
+
+class ROBOT_OT_select_sensor_mount(Operator):
+    bl_idname = "robot_library.select_sensor_mount"
+    bl_label = "Select Sensor Mount"
+    mount_name: StringProperty()
+
+    def execute(self, context):
+        mount = context.scene.objects.get(self.mount_name)
+        if mount is None or not mount.get("sensor_id"):
+            self.report({"ERROR"}, "Sensor mount is no longer available")
+            return {"CANCELLED"}
+        _select_sensor_mount(context, mount)
+        return {"FINISHED"}
+
+
+def _sensor_target_poll(mount, target):
+    ancestor = target
+    while ancestor is not None:
+        if ancestor is mount or ancestor.get("sensor_id") or ancestor.get(sensor_visuals.PREVIEW_KEY):
+            return False
+        ancestor = ancestor.parent
+    return bool(target.get("robot_id") or "mujoco_body_id" in target or target.name.startswith("Body: ")
+                or (target.type == "MESH" and not target.hide_render))
+
+
+def _sensor_attachment_target(target):
+    if target is None:
+        raise ValueError("Choose a robot link or scene mesh as Mount Target")
+    root = mounting.robot_root(target)
+    if root is None:
+        if target.type != "MESH" or target.hide_render:
+            raise ValueError("Choose an exported scene mesh or robot body")
+        return target
+    if Path(str(root.get("model_path", ""))).suffix.lower() != ".xml":
+        raise ValueError("Sensor attachment requires an XML-backed robot")
+    if target is root:
+        bodies = [obj for obj in root.children if "mujoco_body_id" in obj or obj.name.startswith("Body: ")]
+        if len(bodies) != 1:
+            raise ValueError("Choose a specific robot body as Mount Target")
+        return bodies[0]
+    while target is not root and "mujoco_body_id" not in target and not target.name.startswith("Body: "):
+        target = target.parent
+    return target
+
+
+class ROBOT_OT_mount_scene_sensor(Operator):
+    bl_idname = "robot_library.mount_scene_sensor"
+    bl_label = "Attach Sensor (Keep World Pose)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        mount = sensor_visuals.selected_mount(context.active_object)
+        if mount is None:
+            self.report({"ERROR"}, "Select a sensor object")
+            return {"CANCELLED"}
+        try:
+            target = mount.caryam_sensor_target
+            if target is None or not _sensor_target_poll(mount, target):
+                raise ValueError("Choose a valid robot link or scene mesh as Mount Target")
+            target = _sensor_attachment_target(target)
+            if abs(target.matrix_world.determinant()) < 1e-10:
+                raise ValueError("Mount Target has zero scale")
+            local = target.matrix_world.inverted() @ mount.matrix_world
+            location, rotation, scale = local.decompose()
+            rebuilt = Matrix.LocRotScale(location, rotation, scale)
+            if max(abs(local[r][c] - rebuilt[r][c]) for r in range(4) for c in range(4)) > 1e-5:
+                raise ValueError("Apply target scale before attaching this rotated sensor")
+        except ValueError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        mounting.detach_robot(mount)
+        mount.parent = target
+        mount.matrix_parent_inverse = Matrix.Identity(4)
+        mount.matrix_basis = local
+        mount.caryam_sensor_target = target
+        _select_sensor_mount(context, mount)
+        return {"FINISHED"}
+
+
+class ROBOT_OT_detach_scene_sensor(Operator):
+    bl_idname = "robot_library.detach_scene_sensor"
+    bl_label = "Detach Sensor (Keep World Pose)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        mount = sensor_visuals.selected_mount(context.active_object)
+        if mount is None:
+            return {"CANCELLED"}
+        mounting.detach_robot(mount)
+        mount.matrix_parent_inverse = Matrix.Identity(4)
+        mount.caryam_sensor_target = None
+        _select_sensor_mount(context, mount)
+        return {"FINISHED"}
+
+
+class ROBOT_OT_sensor_preview(Operator):
+    bl_idname = "robot_library.sensor_preview"
+    bl_label = "Add / Update Module Shape"
+    bl_description = "Show a generic camera, lidar or IMU module with local axes; not collision geometry"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        mount = sensor_visuals.selected_mount(context.active_object)
+        if mount is None:
+            self.report({"WARNING"}, "Select a sensor mount first")
+            return {"CANCELLED"}
+        try:
+            definition = _sensor_definition(mount)
+        except (OSError, ValueError, StopIteration, TypeError) as error:
+            self.report({"ERROR"}, f"Cannot read sensor definition: {error}")
+            return {"CANCELLED"}
+        sensor_visuals.update_preview(mount, definition)
+        _select_sensor_mount(context, mount)
         return {"FINISHED"}
 
 
@@ -2216,12 +2406,79 @@ class ROBOT_UL_sensor_library(UIList):
         item: SensorLibraryItem, icon: int, active_data: object, active_propname: str,
         index: int, flt_flag: int = 0,
     ) -> None:
-        icon_name = "OUTLINER_OB_CAMERA" if item.category == "depth_camera" else "OUTLINER_OB_FORCE_FIELD"
+        icon_name = "OUTLINER_OB_CAMERA" if item.category in CAMERA_CATEGORIES else "OUTLINER_OB_FORCE_FIELD"
         layout.label(text=f"{index + 1:03d}  {item.name}", icon=icon_name)
 
 
+def _draw_sensor_mount(layout, context):
+    root = mounting.robot_root(context.active_object)
+    mount = sensor_visuals.selected_mount(context.active_object)
+    if mount is None:
+        return
+    box = layout.box()
+    box.label(text=mount.name, icon="EMPTY_AXIS")
+    if root is None:
+        box.label(text=f"Parent: {mount.parent.name}" if mount.parent else "World sensor (fixed)")
+    if root is not None:
+        frame = sensor_visuals.mount_frame(mount, root)
+        body_name = str(frame.get("mujoco_body_name", frame.name.removeprefix("Body: "))) if frame is not root else "Robot root"
+        box.label(text=f"Link: {body_name}")
+        if mount.parent is not frame:
+            box.label(text=f"Parent: {mount.parent.name if mount.parent else 'None'}")
+            local = frame.matrix_world.inverted_safe() @ mount.matrix_world
+            box.label(text="Link offset: " + ", ".join(f"{value:.3f}" for value in local.translation) + " m")
+    attachment = box.column()
+    attachment.enabled = not live_physics.active()
+    attachment.prop(mount, "caryam_sensor_target", text="Mount Target")
+    attachment.operator("robot_library.mount_scene_sensor", icon="CONSTRAINT_BONE")
+    if mount.parent is not None:
+        attachment.operator("robot_library.detach_scene_sensor", icon="UNLINKED")
+    box.operator("robot_library.sensor_preview", text="Add / Update Module Shape", icon="MESH_CUBE")
+    if context.active_object is not mount:
+        select = box.operator("robot_library.select_sensor_mount", text="Select Mount to Move / Rotate", icon="EMPTY_AXIS")
+        select.mount_name = mount.name
+    pose = box.column()
+    pose.enabled = not live_physics.active()
+    pose.label(text="World pose" if mount.parent is None else "Pose relative to parent")
+    pose.prop(mount, "location", text="Offset")
+    if mount.rotation_mode == "QUATERNION":
+        pose.prop(mount, "rotation_quaternion", text="Rotation")
+    elif mount.rotation_mode == "AXIS_ANGLE":
+        pose.prop(mount, "rotation_axis_angle", text="Rotation")
+    else:
+        pose.prop(mount, "rotation_euler", text="Rotation")
+    housing = sensor_visuals.housing_object(mount)
+    if housing is not None:
+        box.prop(housing, "show_in_front", text="X-Ray Preview")
+    category = str(mount.get("sensor_category", ""))
+    if category == "imu":
+        box.label(text="IMU: acceleration + angular rate in local XYZ")
+    else:
+        box.label(text="Camera forward: -Z; up: +Y" if category in CAMERA_CATEGORIES else "Lidar forward: +X; scan plane: XY")
+    box.label(text="Yellow: origin; RGB: X / Y / Z" if category == "imu" else "Yellow: aim / origin; RGB: X / Y / Z")
+    box.label(text="Generic shape only; no mass or collision")
+    box.label(text="Guides: Viewport Overlays > Caryam Sensors")
+    if category != "imu":
+        box.label(text="Short field guide is not sensing range")
+
+
+class ROBOT_PT_sensor_object(Panel):
+    bl_label = "MuJoCo Sensor"
+    bl_idname = "ROBOT_PT_sensor_object"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+
+    @classmethod
+    def poll(cls, context):
+        return sensor_visuals.selected_mount(context.active_object) is not None
+
+    def draw(self, context):
+        _draw_sensor_mount(self.layout, context)
+
+
 class ROBOT_PT_sensor_library(Panel):
-    bl_label = "Sensor Library"
+    bl_label = "MuJoCo Sensor Library"
     bl_idname = "ROBOT_PT_sensor_library"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -2230,19 +2487,22 @@ class ROBOT_PT_sensor_library(Panel):
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
         scene = context.scene
+        for message in scene.sensor_library_status.splitlines():
+            layout.label(text=message, icon="ERROR")
         if not scene.sensor_library:
             layout.label(text="No sensors discovered", icon="INFO")
             layout.label(text="Add a sensor source and refresh", icon="INFO")
-            return
-        layout.template_list(
-            "ROBOT_UL_sensor_library", "sensor_library", scene, "sensor_library",
-            scene, "sensor_library_index", rows=4,
-        )
-        index = min(scene.sensor_library_index, len(scene.sensor_library) - 1)
-        item = scene.sensor_library[index]
-        layout.label(text=item.category.replace("_", " ").title())
-        attach = layout.operator("robot_library.attach_sensor", text="Attach to Selected Body", icon="CONSTRAINT_BONE")
-        attach.sensor_index = index
+        else:
+            layout.template_list(
+                "ROBOT_UL_sensor_library", "sensor_library", scene, "sensor_library",
+                scene, "sensor_library_index", rows=4,
+            )
+            index = min(scene.sensor_library_index, len(scene.sensor_library) - 1)
+            item = scene.sensor_library[index]
+            layout.label(text=item.category.replace("_", " ").title())
+            add = layout.operator("robot_library.add_sensor", text="Add Sensor to Scene", icon="ADD")
+            add.sensor_index = index
+        layout.label(text="Instance settings: Object Properties > MuJoCo Sensor")
 
 
 class ROBOT_PT_joint_controls(Panel):
@@ -2493,7 +2753,12 @@ CLASSES = (
     ROBOT_OT_load_behavior,
     ROBOT_OT_run_behavior,
     ROBOT_OT_joint_window,
+    ROBOT_OT_add_sensor,
     ROBOT_OT_attach_sensor,
+    ROBOT_OT_mount_scene_sensor,
+    ROBOT_OT_detach_scene_sensor,
+    ROBOT_OT_select_sensor_mount,
+    ROBOT_OT_sensor_preview,
     ROBOT_OT_ros_list_topics,
     ROBOT_OT_ros_echo_topic,
     ROBOT_OT_ros_publish_topic,
@@ -2505,6 +2770,7 @@ CLASSES = (
     ROBOT_UL_sensor_library,
     ROBOT_PT_library,
     ROBOT_PT_sensor_library,
+    ROBOT_PT_sensor_object,
     ROBOT_PT_joint_controls,
     ROBOT_PT_simulation,
     ROBOT_PT_mujoco_world,
@@ -2534,7 +2800,10 @@ for _operator in CLASSES:
 
 
 def _remove_scene_properties() -> None:
+    mounting.unregister_keymaps()
     mounting.unregister_properties()
+    if hasattr(bpy.types.Object, "caryam_sensor_target"):
+        del bpy.types.Object.caryam_sensor_target
     for name in (
         "robot_library",
         "robot_library_index",
@@ -2544,6 +2813,7 @@ def _remove_scene_properties() -> None:
         "robot_asset_sources",
         "sensor_library",
         "sensor_library_index",
+        "sensor_library_status",
         "robot_library_auto_spread",
         "robot_library_include_collisions",
         "robot_library_preview_mode",
@@ -2595,6 +2865,7 @@ def _unregister_existing_classes() -> None:
 
 def register() -> None:
     live_physics.unregister_handlers()
+    sensor_visuals.unregister()
     _remove_scene_properties()
     _unregister_existing_classes()
     for cls in CLASSES:
@@ -2607,6 +2878,8 @@ def register() -> None:
     bpy.types.Scene.robot_asset_sources = CollectionProperty(type=RobotAssetSource)
     bpy.types.Scene.sensor_library = CollectionProperty(type=SensorLibraryItem)
     bpy.types.Scene.sensor_library_index = IntProperty(name="Sensor", default=0, min=0)
+    bpy.types.Scene.sensor_library_status = StringProperty(name="Sensor source diagnostics", default="")
+    bpy.types.Object.caryam_sensor_target = PointerProperty(name="Mount Target", type=bpy.types.Object, poll=_sensor_target_poll)
     bpy.types.Scene.robot_library_auto_spread = BoolProperty(name="Auto-space Add", default=True)
     bpy.types.Scene.robot_library_include_collisions = BoolProperty(name="Load Collision Geoms", default=False)
     bpy.types.Scene.robot_library_preview_mode = EnumProperty(
@@ -2630,11 +2903,12 @@ def register() -> None:
     bpy.types.Scene.robot_magnet_alignment = EnumProperty(
         name="Magnetic Alignment",
         items=(
-            ("OPPOSE", "Face to Face", "Mate outward-facing point normals without overlapping the surfaces"),
-            ("MATCH", "Match Frames", "Match both points' axes"),
-            ("POSITION", "Position Only", "Keep the moving object's orientation"),
+            ("AXIS", "Nearest Axes", "Align to the destination point's nearest local axes; its Destination Axis can override the choice", 0, 3),
+            ("OPPOSE", "Face to Face", "Mate outward-facing point normals without overlapping the surfaces", 0, 0),
+            ("MATCH", "Match Frames", "Match both points' axes", 0, 1),
+            ("POSITION", "Position Only", "Keep the moving object's orientation", 0, 2),
         ),
-        default="OPPOSE",
+        default="AXIS",
     )
     bpy.types.Scene.robot_mujoco_python = StringProperty(name="MuJoCo Python", default="python")
     bpy.types.Scene.robot_mujoco_gravity = FloatVectorProperty(
@@ -2674,9 +2948,12 @@ def register() -> None:
     bpy.types.NODE_MT_add.append(_draw_behavior_add_menu)
     bpy.app.timers.register(_refresh_active_library, first_interval=0.1)
     live_physics.register_handlers()
+    sensor_visuals.register()
+    mounting.register_keymaps()
 
 
 def unregister() -> None:
+    sensor_visuals.unregister()
     live_physics.unregister_handlers()
     if bpy.app.timers.is_registered(_refresh_active_library):
         bpy.app.timers.unregister(_refresh_active_library)

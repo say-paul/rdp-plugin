@@ -6,10 +6,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import bpy
-from bpy.props import BoolProperty, PointerProperty
+from bpy.props import BoolProperty, EnumProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Matrix, Quaternion, Vector
 from mathutils.bvhtree import BVHTree
+
+from . import sensor_visuals
+
+
+_KEYMAP_ITEMS = []
+_AXIS_VECTORS = {
+    "Z": Vector((0, 0, 1)), "NEG_Z": Vector((0, 0, -1)),
+    "X": Vector((1, 0, 0)), "NEG_X": Vector((-1, 0, 0)),
+    "Y": Vector((0, 1, 0)), "NEG_Y": Vector((0, -1, 0)),
+}
 
 
 class CaryamRobotMount(PropertyGroup):
@@ -23,7 +33,7 @@ def robot_root(obj: bpy.types.Object | None) -> bpy.types.Object | None:
     while obj is not None:
         if "robot_id" in obj:
             return obj
-        if obj.type == "MESH" and obj.caryam_mount.enabled:
+        if obj.type == "MESH" and obj.caryam_mount.enabled and not obj.get("sensor_id"):
             return None
         obj = obj.parent
     return None
@@ -31,7 +41,7 @@ def robot_root(obj: bpy.types.Object | None) -> bpy.types.Object | None:
 
 def robot_body(obj: bpy.types.Object | None) -> bpy.types.Object | None:
     while obj is not None and "robot_id" not in obj:
-        if obj.type == "MESH" and obj.caryam_mount.enabled:
+        if obj.type == "MESH" and obj.caryam_mount.enabled and not obj.get("sensor_id"):
             return None
         if "mujoco_body_id" in obj:
             return obj
@@ -63,6 +73,11 @@ def _validate_robot(root: bpy.types.Object) -> None:
 
 
 def _physical_target(target: bpy.types.Object) -> bpy.types.Object:
+    if target.get(sensor_visuals.PREVIEW_KEY) and not target.get(sensor_visuals.HOUSING_KEY):
+        raise ValueError("Sensor guides are overlays, not mount surfaces")
+    sensor = sensor_visuals.selected_mount(target)
+    if sensor is not None:
+        return sensor
     obj = target
     while obj is not None:
         if obj.type == "MESH" and obj.caryam_mount.enabled:
@@ -92,6 +107,8 @@ def _validate_target(root: bpy.types.Object, target: bpy.types.Object) -> bpy.ty
     if _is_descendant(target, root):
         raise ValueError("A robot cannot mount to itself or one of its descendants")
     physical = _physical_target(target)
+    if physical.get("sensor_id"):
+        raise ValueError("Choose an exported mesh or robot body as mount target")
     target_root = robot_root(physical)
     if target_root is not None and target_root.get("import_mode") != "mujoco_compiled":
         raise ValueError("The target robot must be a compiled MJCF model")
@@ -107,6 +124,9 @@ def is_anchor(obj: bpy.types.Object | None) -> bool:
 def moving_object(obj: bpy.types.Object | None) -> bpy.types.Object | None:
     if obj is None:
         return None
+    sensor = sensor_visuals.selected_mount(obj)
+    if sensor is not None:
+        return sensor
     root = robot_root(obj)
     if root is not None:
         return root
@@ -118,8 +138,8 @@ def moving_object(obj: bpy.types.Object | None) -> bpy.types.Object | None:
 def _validate_moving(root: bpy.types.Object) -> None:
     if "robot_id" in root:
         _validate_robot(root)
-    elif root.type != "MESH" or root.hide_render:
-        raise ValueError("Select an exported mesh or compiled robot to move")
+    elif not root.get("sensor_id") and (root.type != "MESH" or root.hide_render):
+        raise ValueError("Select a sensor, exported mesh or compiled robot to move")
     if abs(root.matrix_world.determinant()) < 1e-10:
         raise ValueError("Magnetic snapping requires nonzero object scale")
 
@@ -236,6 +256,20 @@ def snap_candidates(context: bpy.types.Context, root: bpy.types.Object) -> tuple
     return surfaces, points
 
 
+def _nearest_axis_rotation(target_rotation: Quaternion, source_rotation: Quaternion, axis: str) -> Quaternion:
+    source_normal = source_rotation @ Vector((0, 0, 1))
+    if axis == "AUTO":
+        normal = max(_AXIS_VECTORS.values(), key=lambda value: round((target_rotation @ value).dot(source_normal), 7))
+    else:
+        normal = _AXIS_VECTORS[axis]
+    candidates = []
+    for tangent in _AXIS_VECTORS.values():
+        if abs(tangent.dot(normal)) < .5:
+            local = Matrix((tangent, normal.cross(tangent), normal)).transposed().to_quaternion()
+            candidates.append(target_rotation @ local)
+    return max(candidates, key=lambda candidate: round(abs(candidate.dot(source_rotation)), 7))
+
+
 def nearest_snap(
     position: Vector,
     rotation: Quaternion,
@@ -248,7 +282,9 @@ def nearest_snap(
     if nearby_points:
         point = min(nearby_points, key=lambda item: (item.matrix_world.translation - position).length)
         target_rotation = point.matrix_world.to_quaternion()
-        if alignment == "OPPOSE":
+        if alignment == "AXIS":
+            target_rotation = _nearest_axis_rotation(target_rotation, rotation, point.caryam_magnet_axis)
+        elif alignment == "OPPOSE":
             target_rotation = target_rotation @ Quaternion((1, 0, 0), 3.141592653589793)
         elif alignment == "POSITION":
             target_rotation = rotation.copy()
@@ -274,6 +310,8 @@ class _MountMove:
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
+        if context.mode != "OBJECT":
+            return False
         try:
             return moving_object(context.active_object) is not None
         except ValueError:
@@ -342,7 +380,7 @@ class _MountMove:
             return {"CANCELLED"}
         self.region = next(region for region in context.area.regions if region.type == "WINDOW")
         self.region_3d = context.space_data.region_3d
-        self.mouse_offset = self.base_world.translation - self._mouse_position(event)
+        self.mouse_offset = Vector((0, 0, 0)) if self.use_magnets else self.base_world.translation - self._mouse_position(event)
         world = self.root.matrix_world.copy()
         self.root.parent = None
         self.root.matrix_world = snap_transform(self.base_local, self.snap) if self.snap is not None else world
@@ -377,6 +415,10 @@ class _MountMove:
             self._restore(context)
             context.workspace.status_text_set(None)
             return {"CANCELLED"}
+        if self.use_magnets and event.type in {"MOUSEMOVE", "LEFTMOUSE"}:
+            if not (self.region.x <= event.mouse_x < self.region.x + self.region.width
+                    and self.region.y <= event.mouse_y < self.region.y + self.region.height):
+                return {"RUNNING_MODAL"}
         if event.type == "MOUSEMOVE":
             position = self._mouse_position(event) + self.mouse_offset
             rotation = self.base_world.to_quaternion()
@@ -422,7 +464,7 @@ class ROBOT_OT_sticky_move(_MountMove, Operator):
 class ROBOT_OT_magnetic_move(_MountMove, Operator):
     bl_idname = "robot_library.magnetic_move"
     bl_label = "Magnetic Move"
-    bl_description = "Snap a custom point on the moving object to another magnetic point"
+    bl_description = "Snap a custom point to another magnetic point; Ctrl+Shift+M in the 3D viewport"
     bl_options = {"REGISTER", "UNDO", "BLOCKING"}
     magnetic_points = True
 
@@ -463,8 +505,8 @@ def create_magnetic_point(
     point: bpy.types.Object | None = None,
 ) -> bpy.types.Object:
     physical = _physical_target(target)
-    if physical.type == "MESH" and physical.hide_render:
-        raise ValueError("Choose a surface included in MuJoCo export")
+    if physical.type == "MESH" and physical.hide_render and not physical.get("sensor_id"):
+        raise ValueError("Choose a sensor or surface included in MuJoCo export")
     parent_frame = _rigid_matrix(physical.matrix_world)
     inverse = physical.matrix_world.inverted() @ parent_frame
     local = parent_frame.inverted() @ _rigid_matrix(world)
@@ -501,7 +543,7 @@ def surface_hit(context: bpy.types.Context, origin: Vector, direction: Vector) -
         physical = _physical_target(obj)
     except ValueError:
         return None
-    if physical.type == "MESH" and physical.hide_render:
+    if physical.type == "MESH" and physical.hide_render and not physical.get("sensor_id"):
         return None
     rotation = normal.to_track_quat("Z", "Y")
     return physical, Matrix.LocRotScale(location, rotation, Vector((1, 1, 1)))
@@ -561,7 +603,7 @@ class ROBOT_OT_add_magnetic_point(Operator):
         elif event.type == "LEFTMOUSE" and event.value == "PRESS":
             self._hover(context, event)
             if self.hit is None:
-                self.report({"WARNING"}, "Click an exported mesh or robot surface")
+                self.report({"WARNING"}, "Click a sensor housing, exported mesh or robot surface")
                 return {"RUNNING_MODAL"}
             try:
                 point = create_magnetic_point(context, self.hit[0], self.hit[1], self.preview)
@@ -637,6 +679,7 @@ class ROBOT_PT_mounting(Panel):
             box = magnets.box()
             box.prop(obj, "name", text="Point")
             box.prop(obj, "caryam_anchor_enabled", text="Magnetic")
+            box.prop(obj, "caryam_magnet_axis", text="Destination Axis")
             box.prop(obj, "location", text="Offset")
             box.prop(obj, "rotation_euler", text="Rotation")
         try:
@@ -645,7 +688,7 @@ class ROBOT_PT_mounting(Panel):
             root = None
         if root is not None:
             magnets.prop(root.caryam_mount, "source_anchor", text="Moving Point")
-        magnets.operator("robot_library.magnetic_move", icon="SNAP_ON")
+        magnets.operator("robot_library.magnetic_move", text="Magnetic Move (Ctrl+Shift+M)", icon="SNAP_ON")
         magnets.label(text="Select a moving point for Magnetic Move", icon="INFO")
         if root is not None and root.caryam_mount.enabled:
             target = root.caryam_mount.target
@@ -664,9 +707,33 @@ MOUNT_CLASSES = (
 )
 
 
+def register_keymaps() -> None:
+    unregister_keymaps()
+    config = bpy.context.window_manager.keyconfigs.addon
+    if config is not None:
+        keymap = config.keymaps.new(name="Object Mode", space_type="EMPTY")
+        item = keymap.keymap_items.new("robot_library.magnetic_move", "M", "PRESS", ctrl=True, shift=True)
+        _KEYMAP_ITEMS.append((keymap, item))
+
+
+def unregister_keymaps() -> None:
+    for keymap, item in _KEYMAP_ITEMS:
+        keymap.keymap_items.remove(item)
+    _KEYMAP_ITEMS.clear()
+
+
 def register_properties() -> None:
     bpy.types.Object.caryam_mount = PointerProperty(type=CaryamRobotMount)
     bpy.types.Object.caryam_anchor_enabled = BoolProperty(name="Magnetic", default=True)
+    bpy.types.Object.caryam_magnet_axis = EnumProperty(
+        name="Destination Axis", description="Moving point +Z aligns to this axis in the destination point's local frame (Nearest Axes mode)",
+        items=(
+            ("AUTO", "Automatic (Nearest)", "Choose the nearest signed destination axis and nearest quarter-turn twist"),
+            ("X", "+X", "Align moving +Z with destination +X"), ("NEG_X", "-X", "Align moving +Z with destination -X"),
+            ("Y", "+Y", "Align moving +Z with destination +Y"), ("NEG_Y", "-Y", "Align moving +Z with destination -Y"),
+            ("Z", "+Z", "Align moving +Z with destination +Z"), ("NEG_Z", "-Z", "Align moving +Z with destination -Z"),
+        ), default="AUTO",
+    )
 
 
 def unregister_properties() -> None:
@@ -674,3 +741,5 @@ def unregister_properties() -> None:
         del bpy.types.Object.caryam_mount
     if hasattr(bpy.types.Object, "caryam_anchor_enabled"):
         del bpy.types.Object.caryam_anchor_enabled
+    if hasattr(bpy.types.Object, "caryam_magnet_axis"):
+        del bpy.types.Object.caryam_magnet_axis

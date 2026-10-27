@@ -54,6 +54,7 @@ try:
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete(use_global=False)
     scene = bpy.context.scene
+    scene.robot_magnet_alignment = "OPPOSE"
     bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, 0))
     table = bpy.context.object
     table.name = "Target Table"
